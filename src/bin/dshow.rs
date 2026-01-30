@@ -51,6 +51,9 @@ struct Args {
 
     #[arg(long, default_value = "150", help = "Maximum file size in MB to include in snapshot")]
     max_size: u64,
+
+    #[arg(long, help = "Number of threads for parallel file verification (default: 90% of CPU cores)")]
+    threads: Option<usize>,
 }
 
 fn add_log_entry(log_buffer: &Arc<Mutex<Vec<LogEntry>>>, message: String) {
@@ -76,6 +79,8 @@ struct App {
     show_log: bool,
     log_selected: usize,
     sha256_cache: HashMap<PathBuf, String>, // Cache SHA256 hashes separately
+    show_save_popup: bool,
+    save_filename: String,
 }
 
 impl App {
@@ -96,6 +101,8 @@ impl App {
             show_log: false,
             log_selected: 0,
             sha256_cache: HashMap::new(),
+            show_save_popup: false,
+            save_filename: String::new(),
         }
     }
 
@@ -114,6 +121,12 @@ impl App {
     }
 
     fn refresh_live_snapshot(&mut self) {
+        // Don't refresh every frame - UI doesn't need full snapshot clone
+        // The get_filtered_items will fetch what it needs directly from monitor
+    }
+
+    fn refresh_full_snapshot(&mut self) {
+        // Only use this when we need the full snapshot (e.g., for saving)
         if let Some(ref monitor) = self.monitor {
             let monitor = monitor.lock().unwrap();
             self.new_snapshot = monitor.get_snapshot();
@@ -124,8 +137,17 @@ impl App {
         // Get all items in the current directory from the new snapshot
         let mut items: Vec<DiffNode> = Vec::new();
 
-        // Collect all files/dirs that are children of current_dir in the new snapshot
-        for (path, node) in &self.new_snapshot.nodes {
+        // Get current directory nodes from monitor (fast - only clones ~50 nodes)
+        let current_nodes = if let Some(ref monitor_arc) = self.monitor {
+            let monitor = monitor_arc.lock().unwrap();
+            let (_root, nodes) = monitor.get_directory_snapshot(&self.current_dir);
+            nodes
+        } else {
+            self.new_snapshot.nodes.clone()
+        };
+
+        // Collect all files/dirs that are children of current_dir
+        for (path, node) in &current_nodes {
             if let Some(parent) = path.parent() {
                 if parent == self.current_dir {
                     // Check if this path exists in old snapshot for comparison
@@ -166,10 +188,10 @@ impl App {
             }
         }
 
-        // Also check for removed items (in old but not in new)
+        // Also check for removed items (in old but not in current view)
         for (path, old_node) in &self.old_snapshot.nodes {
             if let Some(parent) = path.parent() {
-                if parent == self.current_dir && !self.new_snapshot.nodes.contains_key(path) {
+                if parent == self.current_dir && !current_nodes.contains_key(path) {
                     let mut diff_node = DiffNode {
                         path: path.clone(),
                         old_node: Some(old_node.clone()),
@@ -198,7 +220,7 @@ impl App {
             for (path, _change_time) in change_times.iter() {
                 if let Some(parent) = path.parent() {
                     if parent == self.current_dir
-                        && !self.new_snapshot.nodes.contains_key(path)
+                        && !current_nodes.contains_key(path)
                         && !self.old_snapshot.nodes.contains_key(path)
                     {
                         // This file was added after the initial snapshot and then removed
@@ -235,7 +257,7 @@ impl App {
 
         // Add . (current directory) - check if it exists in either snapshot
         let current_in_old = self.old_snapshot.nodes.get(&self.current_dir);
-        let current_in_new = self.new_snapshot.nodes.get(&self.current_dir);
+        let current_in_new = current_nodes.get(&self.current_dir);
 
         nav_items.push(DiffNode {
             path: self.current_dir.clone(),
@@ -252,7 +274,7 @@ impl App {
             // Only add .. if current_dir is below navigation_root
             if self.current_dir != self.navigation_root && parent >= self.navigation_root.as_path() {
                 let parent_in_old = self.old_snapshot.nodes.get(parent);
-                let parent_in_new = self.new_snapshot.nodes.get(parent);
+                let parent_in_new = current_nodes.get(parent);
 
                 nav_items.push(DiffNode {
                     path: parent.to_path_buf(),
@@ -386,6 +408,17 @@ fn format_flags(flags: u32) -> String {
 fn main() -> Result<(), io::Error> {
     let args = Args::parse();
 
+    // Configure rayon thread pool for parallel file verification
+    let num_threads = args.threads.unwrap_or_else(|| {
+        let cpus = num_cpus::get();
+        ((cpus as f64 * 0.9).ceil() as usize).max(1)
+    });
+
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(num_threads)
+        .build_global()
+        .unwrap();
+
     let log_buffer = Arc::new(Mutex::new(Vec::new()));
 
     let (old_snapshot, new_snapshot, live_mode, monitor, has_reference_snapshot) = if let Some(live_path) = &args.live {
@@ -415,6 +448,8 @@ fn main() -> Result<(), io::Error> {
 
         let mut monitor = Monitor::new(reference_snapshot.clone(), critical_paths, Some(Arc::clone(&log_buffer)), args.max_size)?;
         monitor.setup_watches(&root_path)?;
+
+        add_log_entry(&log_buffer, format!("Using {} threads for parallel verification", num_threads));
 
         let monitor_arc = Arc::new(Mutex::new(monitor));
         let monitor_clone = Arc::clone(&monitor_arc);
@@ -486,13 +521,22 @@ fn main() -> Result<(), io::Error> {
                     };
 
                     if let Ok(changed_files) = changed_files {
-                        for path in changed_files {
+                        let total_files = changed_files.len();
+                        if total_files > 0 {
+                            add_log_entry(&log_bg, format!("Verify found {} changed files", total_files));
+
+                            // Batch update all changed files - locks only once!
                             let monitor = monitor_bg.lock().unwrap();
-                            let result = monitor.update_file(&path);
+                            let results = monitor.update_files_batch(changed_files);
                             drop(monitor);
 
-                            if let Ok((true, _, _)) = result {
-                                add_log_entry(&log_bg, format!("Verified changed: {}", path.display()));
+                            if let Ok(results) = results {
+                                for (path, updated, _, content_changed) in results {
+                                    if updated {
+                                        let change_type = if content_changed { "content" } else { "metadata" };
+                                        add_log_entry(&log_bg, format!("Updated ({}): {}", change_type, path.display()));
+                                    }
+                                }
                             }
                         }
                     }
@@ -503,13 +547,20 @@ fn main() -> Result<(), io::Error> {
                     };
 
                     if let Ok(new_files) = new_files {
-                        for path in new_files {
+                        if !new_files.is_empty() {
+                            add_log_entry(&log_bg, format!("Found {} new files", new_files.len()));
+
+                            // Batch update all new files - locks only once!
                             let monitor = monitor_bg.lock().unwrap();
-                            let result = monitor.update_file(&path);
+                            let results = monitor.update_files_batch(new_files);
                             drop(monitor);
 
-                            if let Ok((true, _, _)) = result {
-                                add_log_entry(&log_bg, format!("New file: {}", path.display()));
+                            if let Ok(results) = results {
+                                for (path, updated, _, _) in results {
+                                    if updated {
+                                        add_log_entry(&log_bg, format!("New file: {}", path.display()));
+                                    }
+                                }
                             }
                         }
                     }
@@ -948,6 +999,50 @@ fn main() -> Result<(), io::Error> {
                     &mut ratatui::widgets::ListState::default().with_selected(Some(app.log_selected)),
                 );
             }
+
+            // Render save popup if enabled
+            if app.show_save_popup {
+                let popup_width = 60u16.min(f.area().width.saturating_sub(6));
+                let popup_height = 7u16;
+
+                let popup_area = ratatui::layout::Rect {
+                    x: (f.area().width.saturating_sub(popup_width)) / 2,
+                    y: (f.area().height.saturating_sub(popup_height)) / 2,
+                    width: popup_width,
+                    height: popup_height,
+                };
+
+                let popup_lines = vec![
+                    Line::from(vec![
+                        Span::styled("Enter filename to save snapshot:", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                    ]),
+                    Line::from(""),
+                    Line::from(vec![
+                        Span::raw(&app.save_filename),
+                        Span::styled("█", Style::default().fg(Color::White)),  // Cursor
+                    ]),
+                    Line::from(""),
+                    Line::from(vec![
+                        Span::styled("[Enter]", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+                        Span::raw(" Save  "),
+                        Span::styled("[Esc]", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+                        Span::raw(" Cancel"),
+                    ]),
+                ];
+
+                let popup = Paragraph::new(popup_lines)
+                    .block(
+                        Block::default()
+                            .title("Save Snapshot")
+                            .borders(Borders::ALL)
+                            .border_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+                            .style(Style::default().bg(Color::Black))
+                    )
+                    .alignment(Alignment::Left);
+
+                f.render_widget(Clear, popup_area);
+                f.render_widget(popup, popup_area);
+            }
         })?;
 
         if event::poll(std::time::Duration::from_millis(100))? {
@@ -955,6 +1050,43 @@ fn main() -> Result<(), io::Error> {
                 // If hash popup is showing, close it on any key press
                 if app.show_hash_popup {
                     app.show_hash_popup = false;
+                    continue;
+                }
+
+                // If save popup is showing, handle text input
+                if app.show_save_popup {
+                    match key.code {
+                        KeyCode::Enter => {
+                            // Save the file
+                            let save_path = app.save_filename.clone();
+                            app.show_save_popup = false;
+
+                            // Refresh full snapshot before saving
+                            app.refresh_full_snapshot();
+
+                            app.add_log(format!("Saving snapshot to: {}", save_path));
+                            match save_snapshot(&app.new_snapshot, &save_path) {
+                                Ok(_) => {
+                                    app.add_log(format!("Snapshot saved successfully to: {}", save_path));
+                                }
+                                Err(e) => {
+                                    app.add_log(format!("Error saving snapshot: {}", e));
+                                }
+                            }
+                        }
+                        KeyCode::Esc => {
+                            // Cancel save
+                            app.show_save_popup = false;
+                            app.save_filename.clear();
+                        }
+                        KeyCode::Backspace => {
+                            app.save_filename.pop();
+                        }
+                        KeyCode::Char(c) => {
+                            app.save_filename.push(c);
+                        }
+                        _ => {}
+                    }
                     continue;
                 }
 
@@ -1012,22 +1144,15 @@ fn main() -> Result<(), io::Error> {
                     }
                     KeyCode::Char('s') | KeyCode::Char('S') => {
                         if app.live_mode {
-                            let save_path = if persist {
+                            // Show save popup with default filename
+                            let default_filename = if persist {
                                 snapshot1_path.clone().unwrap_or_else(|| "snapshot.snap".to_string())
                             } else {
                                 let now = jiff::Zoned::now();
                                 format!("snapshot-{}.snap", now.strftime("%Y%m%d-%H%M%S"))
                             };
-
-                            app.add_log(format!("Saving snapshot to: {}", save_path));
-                            match save_snapshot(&app.new_snapshot, &save_path) {
-                                Ok(_) => {
-                                    app.add_log(format!("Snapshot saved successfully to: {}", save_path));
-                                }
-                                Err(e) => {
-                                    app.add_log(format!("Error saving snapshot: {}", e));
-                                }
-                            }
+                            app.save_filename = default_filename;
+                            app.show_save_popup = true;
                         }
                     }
                     _ => {}

@@ -1,6 +1,6 @@
 [package]
 name = "diffie"
-version = "0.1.0"
+version = "0.0.2"
 edition = "2021"
 
 [[bin]]
@@ -17,6 +17,7 @@ jiff = "0.1"
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.29.0"
 notify = "6.1"
+num_cpus = "1.16"
 ratatui = "0.29.0"
 rayon = "1.10.0"
 serde = { version = "1.0.219", features = ["derive"] }

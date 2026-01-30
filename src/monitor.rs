@@ -1,5 +1,6 @@
 use crate::{hash_directory, hash_file, FileNode, LogEntry, Snapshot};
 use notify::{Watcher, RecursiveMode, Event, EventKind};
+use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 #[allow(unused_imports)]
 use std::fs;
@@ -327,8 +328,9 @@ impl Monitor {
                                         events.push(FileEvent::Created(path));
                                     }
                                 }
-                                EventKind::Modify(_) => {
-                                    // For modify, only process if it's a file
+                                EventKind::Modify(_) | EventKind::Any => {
+                                    // For modify/any, process if it's a file
+                                    // This includes content changes, metadata changes, and attribute changes
                                     if path.is_file() {
                                         events.push(FileEvent::Modified(path));
                                     }
@@ -446,6 +448,181 @@ impl Monitor {
         }
     }
 
+    /// Batch update multiple files at once - much more efficient than calling update_file repeatedly
+    /// This hashes files in parallel, then locks once to update all files
+    pub fn update_files_batch(&self, paths: Vec<PathBuf>) -> std::io::Result<Vec<(PathBuf, bool, Option<i64>, bool)>> {
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // First, hash all files in parallel without holding any locks
+        #[derive(Clone)]
+        struct FileData {
+            path: PathBuf,
+            hash: u64,
+            size: u64,
+            #[cfg(unix)]
+            uid: u32,
+            #[cfg(unix)]
+            gid: u32,
+            #[cfg(unix)]
+            mode: u32,
+            #[cfg(unix)]
+            mtime: i64,
+            #[cfg(unix)]
+            atime: i64,
+            #[cfg(unix)]
+            ctime: i64,
+            #[cfg(unix)]
+            nlink: u64,
+            #[cfg(unix)]
+            xattrs: HashMap<String, Vec<u8>>,
+            #[cfg(target_os = "macos")]
+            flags: u32,
+            #[cfg(target_os = "linux")]
+            flags: u32,
+        }
+
+        // Extract max_size_bytes to avoid capturing self in closure
+        let max_size = self.max_size_bytes;
+
+        let file_data: Vec<Option<FileData>> = paths
+            .par_iter()
+            .map(|path| {
+                // Check if file exists and is valid
+                let metadata = path.metadata().ok()?;
+
+                if !metadata.is_file() {
+                    return None;
+                }
+
+                // Skip files that exceed size limit
+                if metadata.len() >= max_size {
+                    return None;
+                }
+
+                let hash = hash_file(path).ok()?;
+
+                Some(FileData {
+                    path: path.clone(),
+                    hash,
+                    size: metadata.len(),
+                    #[cfg(unix)]
+                    uid: metadata.uid(),
+                    #[cfg(unix)]
+                    gid: metadata.gid(),
+                    #[cfg(unix)]
+                    mode: metadata.mode(),
+                    #[cfg(unix)]
+                    mtime: metadata.mtime(),
+                    #[cfg(unix)]
+                    atime: metadata.atime(),
+                    #[cfg(unix)]
+                    ctime: metadata.ctime(),
+                    #[cfg(unix)]
+                    nlink: metadata.nlink(),
+                    #[cfg(unix)]
+                    xattrs: crate::get_xattrs(path),
+                    #[cfg(target_os = "macos")]
+                    flags: metadata.st_flags(),
+                    #[cfg(target_os = "linux")]
+                    flags: crate::get_linux_flags(path),
+                })
+            })
+            .collect();
+
+        // Now lock once and update all files
+        let now = jiff::Timestamp::now().as_second();
+        let mut snapshot = self.snapshot.lock().unwrap();
+        let mut results = Vec::new();
+
+        for data_opt in file_data {
+            if let Some(data) = data_opt {
+                let path = &data.path;
+
+                let (content_changed, metadata_changed) = if let Some(existing) = snapshot.nodes.get(path) {
+                    let content = existing.hash != data.hash;
+
+                    #[cfg(unix)]
+                    let metadata = existing.mtime != data.mtime
+                        || existing.mode != data.mode
+                        || existing.uid != data.uid
+                        || existing.gid != data.gid
+                        || existing.nlink != data.nlink
+                        || existing.xattrs != data.xattrs;
+
+                    #[cfg(target_os = "macos")]
+                    let metadata = metadata || existing.flags != data.flags;
+
+                    #[cfg(target_os = "linux")]
+                    let metadata = metadata || existing.flags != data.flags;
+
+                    #[cfg(not(unix))]
+                    let metadata = false;
+
+                    (content, metadata)
+                } else {
+                    (true, true)  // New file
+                };
+
+                let updated = content_changed || metadata_changed;
+
+                if updated {
+                    snapshot.nodes.insert(
+                        path.to_path_buf(),
+                        FileNode {
+                            path: path.to_path_buf(),
+                            hash: data.hash,
+                            size: data.size,
+                            is_dir: false,
+                            #[cfg(unix)]
+                            uid: data.uid,
+                            #[cfg(unix)]
+                            gid: data.gid,
+                            #[cfg(unix)]
+                            mode: data.mode,
+                            #[cfg(unix)]
+                            mtime: data.mtime,
+                            #[cfg(unix)]
+                            atime: data.atime,
+                            #[cfg(unix)]
+                            ctime: data.ctime,
+                            #[cfg(unix)]
+                            nlink: data.nlink,
+                            #[cfg(unix)]
+                            xattrs: data.xattrs,
+                            #[cfg(target_os = "macos")]
+                            flags: data.flags,
+                            #[cfg(target_os = "linux")]
+                            flags: data.flags,
+                        },
+                    );
+
+                    // Bubble up changes to parent directories
+                    self.recalculate_parent_hashes(&mut snapshot, path, content_changed, true);
+
+                    results.push((path.clone(), true, Some(now), content_changed));
+                } else {
+                    results.push((path.clone(), false, None, false));
+                }
+            }
+        }
+
+        // Update change times after releasing snapshot lock
+        drop(snapshot);
+
+        let mut change_times = self.change_times.lock().unwrap();
+        for (path, updated, time, _) in &results {
+            if *updated {
+                if let Some(t) = time {
+                    change_times.insert(path.clone(), *t);
+                }
+            }
+        }
+
+        Ok(results)
+    }
+
     pub fn get_change_time(&self, path: &Path) -> Option<i64> {
         let change_times = self.change_times.lock().unwrap();
         change_times.get(path).copied()
@@ -560,60 +737,105 @@ impl Monitor {
     }
 
     pub fn verify_all_files(&self) -> std::io::Result<Vec<PathBuf>> {
-        // Lock briefly to get list of files to check, then release
-        let files_to_check: Vec<(PathBuf, FileNode)> = {
+        // Lightweight struct for comparison - only what we need, no expensive clones
+        #[derive(Clone)]
+        struct FileSnapshot {
+            path: PathBuf,
+            hash: u64,
+            #[cfg(unix)]
+            mtime: i64,
+            #[cfg(unix)]
+            mode: u32,
+            #[cfg(unix)]
+            uid: u32,
+            #[cfg(unix)]
+            gid: u32,
+            #[cfg(unix)]
+            nlink: u64,
+            #[cfg(unix)]
+            xattrs_count: usize,  // Just count, not full HashMap
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            flags: u32,
+        }
+
+        // Lock briefly to get minimal comparison data, then release
+        let files_to_check: Vec<FileSnapshot> = {
             let snapshot = self.snapshot.lock().unwrap();
             snapshot.nodes.iter()
                 .filter(|(_, node)| !node.is_dir)
-                .map(|(path, node)| (path.clone(), node.clone()))
+                .map(|(path, node)| FileSnapshot {
+                    path: path.clone(),
+                    hash: node.hash,
+                    #[cfg(unix)]
+                    mtime: node.mtime,
+                    #[cfg(unix)]
+                    mode: node.mode,
+                    #[cfg(unix)]
+                    uid: node.uid,
+                    #[cfg(unix)]
+                    gid: node.gid,
+                    #[cfg(unix)]
+                    nlink: node.nlink,
+                    #[cfg(unix)]
+                    xattrs_count: node.xattrs.len(),
+                    #[cfg(any(target_os = "macos", target_os = "linux"))]
+                    flags: node.flags,
+                })
                 .collect()
         };
 
-        // Now do expensive operations without holding the lock
-        let mut changed = Vec::new();
+        // Process files in parallel using rayon
+        let changed: Vec<PathBuf> = files_to_check
+            .par_iter()
+            .filter_map(|snap| {
+                let path = &snap.path;
+                // Check if file still exists
+                if let Ok(metadata) = path.metadata() {
+                    // Re-hash the file to check for changes
+                    if let Ok(current_hash) = hash_file(path) {
+                        #[cfg(unix)]
+                        let mut has_changes = current_hash != snap.hash
+                            || metadata.mtime() != snap.mtime
+                            || metadata.mode() != snap.mode
+                            || metadata.uid() != snap.uid
+                            || metadata.gid() != snap.gid
+                            || metadata.nlink() != snap.nlink;
 
-        for (path, node) in files_to_check {
-            // Check if file still exists
-            if let Ok(metadata) = path.metadata() {
-                // Re-hash the file to check for changes
-                if let Ok(current_hash) = hash_file(&path) {
-                    #[cfg(unix)]
-                    let mut has_changes = current_hash != node.hash
-                        || metadata.mtime() != node.mtime
-                        || metadata.mode() != node.mode
-                        || metadata.uid() != node.uid
-                        || metadata.gid() != node.gid
-                        || metadata.nlink() != node.nlink;
+                        #[cfg(target_os = "macos")]
+                        {
+                            has_changes = has_changes || metadata.st_flags() != snap.flags;
+                        }
 
-                    #[cfg(unix)]
-                    {
-                        let current_xattrs = crate::get_xattrs(&path);
-                        has_changes = has_changes || current_xattrs != node.xattrs;
+                        #[cfg(target_os = "linux")]
+                        {
+                            let current_flags = crate::get_linux_flags(path);
+                            has_changes = has_changes || current_flags != snap.flags;
+                        }
+
+                        #[cfg(not(unix))]
+                        let has_changes = current_hash != snap.hash;
+
+                        // For xattrs, do a quick count check if nothing else changed
+                        // This avoids expensive cloning and comparison of xattr values
+                        #[cfg(unix)]
+                        let has_changes = if !has_changes {
+                            let current_xattrs = crate::get_xattrs(path);
+                            current_xattrs.len() != snap.xattrs_count
+                        } else {
+                            true
+                        };
+
+                        if has_changes {
+                            return Some(path.clone());
+                        }
                     }
-
-                    #[cfg(target_os = "macos")]
-                    {
-                        has_changes = has_changes || metadata.st_flags() != node.flags;
-                    }
-
-                    #[cfg(target_os = "linux")]
-                    {
-                        let current_flags = crate::get_linux_flags(&path);
-                        has_changes = has_changes || current_flags != node.flags;
-                    }
-
-                    #[cfg(not(unix))]
-                    let has_changes = current_hash != node.hash;
-
-                    if has_changes {
-                        changed.push(path);
-                    }
+                } else {
+                    // File no longer exists
+                    return Some(path.clone());
                 }
-            } else {
-                // File no longer exists
-                changed.push(path);
-            }
-        }
+                None
+            })
+            .collect();
 
         Ok(changed)
     }
@@ -663,5 +885,36 @@ impl Monitor {
 
     pub fn get_snapshot(&self) -> Snapshot {
         self.snapshot.lock().unwrap().clone()
+    }
+
+    /// Get only the nodes in a specific directory - much faster than cloning entire snapshot
+    /// Returns (root_path, nodes_map) where nodes_map contains only files/dirs in the given directory
+    pub fn get_directory_snapshot(&self, dir: &Path) -> (PathBuf, HashMap<PathBuf, crate::FileNode>) {
+        let snapshot = self.snapshot.lock().unwrap();
+        let root = snapshot.root.clone();
+
+        // Get the directory node itself if it exists
+        let mut nodes = HashMap::new();
+        if let Some(dir_node) = snapshot.nodes.get(dir) {
+            nodes.insert(dir.to_path_buf(), dir_node.clone());
+        }
+
+        // Get all immediate children of this directory
+        for (path, node) in snapshot.nodes.iter() {
+            if let Some(parent) = path.parent() {
+                if parent == dir {
+                    nodes.insert(path.clone(), node.clone());
+                }
+            }
+        }
+
+        // Also get parent directory if it exists (for ".." navigation)
+        if let Some(parent) = dir.parent() {
+            if let Some(parent_node) = snapshot.nodes.get(parent) {
+                nodes.insert(parent.to_path_buf(), parent_node.clone());
+            }
+        }
+
+        (root, nodes)
     }
 }
