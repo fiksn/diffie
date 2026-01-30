@@ -13,7 +13,7 @@ path = "src/bin/dshow.rs"
 
 [dependencies]
 bincode = "3.0.0"
-jiff = "0.1"
+jiff = "0.2"
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.29.0"
 notify = "8.2"
