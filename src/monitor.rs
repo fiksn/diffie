@@ -349,16 +349,17 @@ impl Monitor {
         events
     }
 
-    pub fn update_file(&self, path: &Path) -> std::io::Result<(bool, Option<i64>, bool)> {
+    /// Returns (updated, change_time, content_changed, change_details)
+    pub fn update_file(&self, path: &Path) -> std::io::Result<(bool, Option<i64>, bool, String)> {
         let file_metadata = path.metadata()?;
 
         if !file_metadata.is_file() {
-            return Ok((false, None, false));
+            return Ok((false, None, false, String::new()));
         }
 
         // Skip files that exceed size limit (consistent with initial snapshot)
         if file_metadata.len() >= self.max_size_bytes {
-            return Ok((false, None, false));
+            return Ok((false, None, false, String::new()));
         }
 
         let hash = hash_file(path)?;
@@ -366,39 +367,65 @@ impl Monitor {
 
         let mut snapshot = self.snapshot.lock().unwrap();
 
-        let (content_changed, metadata_changed) = if let Some(existing) = snapshot.nodes.get(path) {
+        let (content_changed, metadata_changed, change_details) = if let Some(existing) = snapshot.nodes.get(path) {
             let content = existing.hash != hash;
-
-            #[cfg(unix)]
-            let mut metadata = existing.mtime != file_metadata.mtime()
-                || existing.mode != file_metadata.mode()
-                || existing.uid != file_metadata.uid()
-                || existing.gid != file_metadata.gid()
-                || existing.nlink != file_metadata.nlink();
+            let mut changes = Vec::new();
 
             #[cfg(unix)]
             {
+                if existing.mode != file_metadata.mode() {
+                    changes.push("mode");
+                }
+                if existing.uid != file_metadata.uid() {
+                    changes.push("uid");
+                }
+                if existing.gid != file_metadata.gid() {
+                    changes.push("gid");
+                }
+                if existing.nlink != file_metadata.nlink() {
+                    changes.push("nlink");
+                }
+                if existing.mtime != file_metadata.mtime() {
+                    changes.push("mtime");
+                }
+
                 let current_xattrs = crate::get_xattrs(path);
-                metadata = metadata || existing.xattrs != current_xattrs;
+                if existing.xattrs != current_xattrs {
+                    changes.push("xattrs");
+                }
             }
 
             #[cfg(target_os = "macos")]
             {
-                metadata = metadata || existing.flags != file_metadata.st_flags();
+                if existing.flags != file_metadata.st_flags() {
+                    changes.push("flags");
+                }
             }
 
             #[cfg(target_os = "linux")]
             {
                 let current_flags = crate::get_linux_flags(path);
-                metadata = metadata || existing.flags != current_flags;
+                if existing.flags != current_flags {
+                    changes.push("flags");
+                }
             }
 
-            #[cfg(not(unix))]
-            let metadata = false;
+            let metadata = !changes.is_empty();
+            let details = if content {
+                if metadata {
+                    format!("content+{}", changes.join("+"))
+                } else {
+                    "content".to_string()
+                }
+            } else if metadata {
+                changes.join("+")
+            } else {
+                String::new()
+            };
 
-            (content, metadata)
+            (content, metadata, details)
         } else {
-            (true, true)  // New file - both content and metadata are "new"
+            (true, true, "new".to_string())  // New file
         };
 
         let updated = content_changed || metadata_changed;
@@ -442,15 +469,16 @@ impl Monitor {
             let mut change_times = self.change_times.lock().unwrap();
             change_times.insert(path.to_path_buf(), now);
 
-            Ok((true, Some(now), content_changed))
+            Ok((true, Some(now), content_changed, change_details))
         } else {
-            Ok((false, None, false))
+            Ok((false, None, false, String::new()))
         }
     }
 
     /// Batch update multiple files at once - much more efficient than calling update_file repeatedly
     /// This hashes files in parallel, then locks once to update all files
-    pub fn update_files_batch(&self, paths: Vec<PathBuf>) -> std::io::Result<Vec<(PathBuf, bool, Option<i64>, bool)>> {
+    /// Returns (path, updated, change_time, content_changed, change_details)
+    pub fn update_files_batch(&self, paths: Vec<PathBuf>) -> std::io::Result<Vec<(PathBuf, bool, Option<i64>, bool, String)>> {
         if paths.is_empty() {
             return Ok(Vec::new());
         }
@@ -540,29 +568,62 @@ impl Monitor {
             if let Some(data) = data_opt {
                 let path = &data.path;
 
-                let (content_changed, metadata_changed) = if let Some(existing) = snapshot.nodes.get(path) {
+                let (content_changed, metadata_changed, change_details) = if let Some(existing) = snapshot.nodes.get(path) {
                     let content = existing.hash != data.hash;
+                    let mut changes = Vec::new();
 
                     #[cfg(unix)]
-                    let metadata = existing.mtime != data.mtime
-                        || existing.mode != data.mode
-                        || existing.uid != data.uid
-                        || existing.gid != data.gid
-                        || existing.nlink != data.nlink
-                        || existing.xattrs != data.xattrs;
+                    {
+                        if existing.mode != data.mode {
+                            changes.push("mode");
+                        }
+                        if existing.uid != data.uid {
+                            changes.push("uid");
+                        }
+                        if existing.gid != data.gid {
+                            changes.push("gid");
+                        }
+                        if existing.nlink != data.nlink {
+                            changes.push("nlink");
+                        }
+                        if existing.mtime != data.mtime {
+                            changes.push("mtime");
+                        }
+                        if existing.xattrs != data.xattrs {
+                            changes.push("xattrs");
+                        }
+                    }
 
                     #[cfg(target_os = "macos")]
-                    let metadata = metadata || existing.flags != data.flags;
+                    {
+                        if existing.flags != data.flags {
+                            changes.push("flags");
+                        }
+                    }
 
                     #[cfg(target_os = "linux")]
-                    let metadata = metadata || existing.flags != data.flags;
+                    {
+                        if existing.flags != data.flags {
+                            changes.push("flags");
+                        }
+                    }
 
-                    #[cfg(not(unix))]
-                    let metadata = false;
+                    let metadata = !changes.is_empty();
+                    let details = if content {
+                        if metadata {
+                            format!("content+{}", changes.join("+"))
+                        } else {
+                            "content".to_string()
+                        }
+                    } else if metadata {
+                        changes.join("+")
+                    } else {
+                        String::new()
+                    };
 
-                    (content, metadata)
+                    (content, metadata, details)
                 } else {
-                    (true, true)  // New file
+                    (true, true, "new".to_string())  // New file
                 };
 
                 let updated = content_changed || metadata_changed;
@@ -601,9 +662,9 @@ impl Monitor {
                     // Bubble up changes to parent directories
                     self.recalculate_parent_hashes(&mut snapshot, path, content_changed, true);
 
-                    results.push((path.clone(), true, Some(now), content_changed));
+                    results.push((path.clone(), true, Some(now), content_changed, change_details));
                 } else {
-                    results.push((path.clone(), false, None, false));
+                    results.push((path.clone(), false, None, false, String::new()));
                 }
             }
         }
@@ -612,7 +673,7 @@ impl Monitor {
         drop(snapshot);
 
         let mut change_times = self.change_times.lock().unwrap();
-        for (path, updated, time, _) in &results {
+        for (path, updated, time, _, _) in &results {
             if *updated {
                 if let Some(t) = time {
                     change_times.insert(path.clone(), *t);

@@ -124,15 +124,15 @@ fn run_interactive_mode(
                     match event {
                         FileEvent::Created(path) => {
                             match monitor.update_file(&path) {
-                                Ok((true, _, _)) => println!("  ✓ Created: {}", path.display()),
-                                Ok((false, _, _)) => {},
+                                Ok((true, _, _, details)) => println!("  ✓ Created ({}): {}", details, path.display()),
+                                Ok((false, _, _, _)) => {},
                                 Err(e) => println!("  ✗ Error updating {}: {}", path.display(), e),
                             }
                         }
                         FileEvent::Modified(path) => {
                             match monitor.update_file(&path) {
-                                Ok((true, _, _)) => println!("  ✓ Modified: {}", path.display()),
-                                Ok((false, _, _)) => {},
+                                Ok((true, _, _, details)) => println!("  ✓ Modified ({}): {}", details, path.display()),
+                                Ok((false, _, _, _)) => {},
                                 Err(e) => println!("  ✗ Error updating {}: {}", path.display(), e),
                             }
                         }
@@ -152,8 +152,8 @@ fn run_interactive_mode(
                     println!("Verification found {} changed files", changed_files.len());
                     for path in changed_files {
                         match monitor.update_file(&path) {
-                            Ok((true, _, _)) => println!("  ✓ Updated: {}", path.display()),
-                            Ok((false, _, _)) => {},
+                            Ok((true, _, _, details)) => println!("  ✓ Updated ({}): {}", details, path.display()),
+                            Ok((false, _, _, _)) => {},
                             Err(e) => println!("  ✗ Error updating {}: {}", path.display(), e),
                         }
                     }

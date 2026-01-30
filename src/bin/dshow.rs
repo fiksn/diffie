@@ -54,6 +54,9 @@ struct Args {
 
     #[arg(long, help = "Number of threads for parallel file verification (default: 90% of CPU cores)")]
     threads: Option<usize>,
+
+    #[arg(long, help = "Brief mode: print changes to stdout instead of launching TUI")]
+    brief: bool,
 }
 
 fn add_log_entry(log_buffer: &Arc<Mutex<Vec<LogEntry>>>, message: String) {
@@ -491,8 +494,8 @@ fn main() -> Result<(), io::Error> {
                                 let result = monitor.update_file(&path);
                                 drop(monitor);
 
-                                if let Ok((true, _, _)) = result {
-                                    add_log_entry(&log_clone, format!("Created: {}", path.display()));
+                                if let Ok((true, _, _, details)) = result {
+                                    add_log_entry(&log_clone, format!("Created ({}): {}", details, path.display()));
                                 }
                             }
                             FileEvent::Modified(path) => {
@@ -500,8 +503,8 @@ fn main() -> Result<(), io::Error> {
                                 let result = monitor.update_file(&path);
                                 drop(monitor);
 
-                                if let Ok((true, _, _)) = result {
-                                    add_log_entry(&log_clone, format!("Modified: {}", path.display()));
+                                if let Ok((true, _, _, details)) = result {
+                                    add_log_entry(&log_clone, format!("Modified ({}): {}", details, path.display()));
                                 }
                             }
                             FileEvent::Removed(path) => {
@@ -546,10 +549,9 @@ fn main() -> Result<(), io::Error> {
                             drop(monitor);
 
                             if let Ok(results) = results {
-                                for (path, updated, _, content_changed) in results {
+                                for (path, updated, _, _, details) in results {
                                     if updated {
-                                        let change_type = if content_changed { "content" } else { "metadata" };
-                                        add_log_entry(&log_bg, format!("Updated ({}): {}", change_type, path.display()));
+                                        add_log_entry(&log_bg, format!("Updated ({}): {}", details, path.display()));
                                     }
                                 }
                             }
@@ -571,9 +573,9 @@ fn main() -> Result<(), io::Error> {
                             drop(monitor);
 
                             if let Ok(results) = results {
-                                for (path, updated, _, _) in results {
+                                for (path, updated, _, _, details) in results {
                                     if updated {
-                                        add_log_entry(&log_bg, format!("New file: {}", path.display()));
+                                        add_log_entry(&log_bg, format!("New file ({}): {}", details, path.display()));
                                     }
                                 }
                             }
@@ -600,6 +602,83 @@ fn main() -> Result<(), io::Error> {
 
         let old_snapshot = load_snapshot(snapshot1)?;
         let new_snapshot = load_snapshot(snapshot2)?;
+
+        // Determine the overlapping scope for comparison
+        // Only compare files within the narrower of the two snapshot roots
+        let compare_scope = if new_snapshot.root.starts_with(&old_snapshot.root) {
+            // new is subset of old (e.g., old=/, new=/etc) - compare only /etc
+            new_snapshot.root.clone()
+        } else if old_snapshot.root.starts_with(&new_snapshot.root) {
+            // old is subset of new (e.g., old=/etc, new=/) - compare only /etc
+            old_snapshot.root.clone()
+        } else {
+            // Different paths - use new snapshot's root
+            new_snapshot.root.clone()
+        };
+
+        // Populate log with all changes between snapshots (only within compare_scope)
+        for (path, new_node) in &new_snapshot.nodes {
+            if !path.starts_with(&compare_scope) {
+                continue; // Skip files outside comparison scope
+            }
+
+            if let Some(old_node) = old_snapshot.nodes.get(path) {
+                // File exists in both - check what changed
+                let mut changes = Vec::new();
+
+                if old_node.hash != new_node.hash {
+                    changes.push("content");
+                }
+
+                #[cfg(unix)]
+                {
+                    if old_node.mode != new_node.mode {
+                        changes.push("mode");
+                    }
+                    if old_node.uid != new_node.uid {
+                        changes.push("uid");
+                    }
+                    if old_node.gid != new_node.gid {
+                        changes.push("gid");
+                    }
+                    if old_node.nlink != new_node.nlink {
+                        changes.push("nlink");
+                    }
+                    if old_node.mtime != new_node.mtime {
+                        changes.push("mtime");
+                    }
+                    if old_node.xattrs != new_node.xattrs {
+                        changes.push("xattrs");
+                    }
+                }
+
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
+                {
+                    if old_node.flags != new_node.flags {
+                        changes.push("flags");
+                    }
+                }
+
+                if !changes.is_empty() {
+                    let details = changes.join("+");
+                    add_log_entry(&log_buffer, format!("Modified ({}): {}", details, path.display()));
+                }
+            } else {
+                // New file (exists in new but not old)
+                add_log_entry(&log_buffer, format!("Added: {}", path.display()));
+            }
+        }
+
+        // Check for removed files (exists in old but not new, within compare scope)
+        for (path, _old_node) in &old_snapshot.nodes {
+            if !path.starts_with(&compare_scope) {
+                continue; // Skip files outside comparison scope
+            }
+            if !new_snapshot.nodes.contains_key(path) {
+                add_log_entry(&log_buffer, format!("Removed: {}", path.display()));
+            }
+        }
+
         (old_snapshot, new_snapshot, false, None, true)
     };
 
@@ -640,12 +719,44 @@ fn main() -> Result<(), io::Error> {
         root
     };
 
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    // Brief mode: just print logs to stdout (either requested or if TUI fails)
+    let terminal_result = if !args.brief {
+        enable_raw_mode()
+            .and_then(|_| {
+                let mut stdout = io::stdout();
+                execute!(stdout, EnterAlternateScreen)?;
+                let backend = CrosstermBackend::new(stdout);
+                Terminal::new(backend)
+            })
+    } else {
+        Err(io::Error::new(io::ErrorKind::Other, "Brief mode requested"))
+    };
 
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
+    let mut terminal = match terminal_result {
+        Ok(term) => term,
+        Err(e) => {
+            // Brief mode or TUI failed to launch - print logs to stdout instead
+            if !args.brief {
+                eprintln!("Warning: Could not initialize TUI: {}", e);
+                eprintln!("Printing changes to stdout instead:\n");
+            }
+
+            let log = log_buffer.lock().unwrap();
+            if log.is_empty() {
+                println!("No changes detected.");
+            } else {
+                for entry in log.iter() {
+                    let time_str = jiff::Timestamp::from_second(entry.timestamp)
+                        .ok()
+                        .map(|ts| ts.strftime("%Y-%m-%d %H:%M:%S").to_string())
+                        .unwrap_or_else(|| format!("{}", entry.timestamp));
+                    println!("[{}] {}", time_str, entry.message);
+                }
+            }
+
+            return Ok(());
+        }
+    };
 
     let mut app = App::new(old_snapshot, new_snapshot, live_mode, monitor, navigation_root, log_buffer);
     let persist = args.persist;
@@ -996,7 +1107,7 @@ fn main() -> Result<(), io::Error> {
                 let log_list = List::new(log_items)
                     .block(
                         Block::default()
-                            .title("Activity Log [l]close [j/k]navigate [q/^C]quit")
+                            .title("Activity Log [↵]goto [PgUp/PgDn]scroll [j/k]navigate [l]close [q/^C]quit")
                             .borders(Borders::ALL)
                             .border_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
                             .style(Style::default().bg(Color::Black))
@@ -1132,33 +1243,40 @@ fn main() -> Result<(), io::Error> {
                         }
                         KeyCode::Enter => {
                             // Try to extract file path from selected log entry and navigate to it
-                            let log = app.log_buffer.lock().unwrap();
-                            if app.log_selected < log.len() {
-                                let entry = &log[log.len() - 1 - app.log_selected]; // Reversed list
-                                let message = &entry.message;
+                            let path_to_navigate = {
+                                let log = app.log_buffer.lock().unwrap();
+                                if app.log_selected < log.len() {
+                                    let entry = &log[log.len() - 1 - app.log_selected]; // Reversed list
+                                    let message = &entry.message;
 
-                                // Extract path from messages like "Created: /path/to/file" or "Modified: /path"
-                                let path_str = if let Some(colon_pos) = message.find(':') {
-                                    message[colon_pos + 1..].trim()
-                                } else {
-                                    ""
-                                };
+                                    // Extract path from messages like "Created: /path/to/file" or "Modified: /path"
+                                    let path_str = if let Some(colon_pos) = message.find(':') {
+                                        message[colon_pos + 1..].trim()
+                                    } else {
+                                        ""
+                                    };
 
-                                if !path_str.is_empty() {
-                                    let path = PathBuf::from(path_str);
-                                    // Navigate to parent directory if it's a file
-                                    if let Some(parent) = path.parent() {
-                                        if parent.starts_with(&app.navigation_root) {
-                                            drop(log);
-                                            app.current_dir = parent.to_path_buf();
-                                            app.selected = 0;
-                                            app.show_log = false;
-                                            app.log_selected = 0;
-                                        }
+                                    if !path_str.is_empty() {
+                                        let path = PathBuf::from(path_str);
+                                        // Get parent directory if it's a file
+                                        path.parent().map(|p| p.to_path_buf())
+                                    } else {
+                                        None
                                     }
+                                } else {
+                                    None
+                                }
+                            };
+
+                            // Navigate if we found a valid path
+                            if let Some(parent) = path_to_navigate {
+                                if parent.starts_with(&app.navigation_root) {
+                                    app.current_dir = parent;
+                                    app.selected = 0;
+                                    app.show_log = false;
+                                    app.log_selected = 0;
                                 }
                             }
-                            drop(log);
                         }
                         KeyCode::Char('q') => break,
                         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
