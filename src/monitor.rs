@@ -76,6 +76,7 @@ pub struct Monitor {
     #[allow(dead_code)]
     watch_budget: usize,
     watches_used: usize,
+    max_size_bytes: u64,
     change_times: Arc<Mutex<HashMap<PathBuf, i64>>>,
     log_buffer: Option<Arc<Mutex<Vec<LogEntry>>>>,
     #[cfg(target_os = "linux")]
@@ -101,7 +102,9 @@ impl Monitor {
         }
     }
 
-    pub fn new(snapshot: Snapshot, critical_dirs: Vec<PathBuf>, log_buffer: Option<Arc<Mutex<Vec<LogEntry>>>>) -> std::io::Result<Self> {
+    pub fn new(snapshot: Snapshot, critical_dirs: Vec<PathBuf>, log_buffer: Option<Arc<Mutex<Vec<LogEntry>>>>, max_size_mb: u64) -> std::io::Result<Self> {
+        let max_size_bytes = max_size_mb * 1024 * 1024;
+
         #[cfg(target_os = "linux")]
         {
             let inotify = Some(Inotify::init()?);
@@ -114,6 +117,7 @@ impl Monitor {
                 watched_dirs: HashSet::new(),
                 watch_budget,
                 watches_used: 0,
+                max_size_bytes,
                 change_times: Arc::new(Mutex::new(HashMap::new())),
                 log_buffer,
                 inotify,
@@ -126,6 +130,7 @@ impl Monitor {
             monitor.log(format!("  max_user_instances: {}", limits.max_user_instances));
             monitor.log(format!("  max_queued_events: {}", limits.max_queued_events));
             monitor.log(format!("  Using 70% budget: {} watches", watch_budget));
+            monitor.log(format!("  Max file size: {} MB", max_size_mb));
 
             Ok(monitor)
         }
@@ -144,6 +149,7 @@ impl Monitor {
                 watched_dirs: HashSet::new(),
                 watch_budget,
                 watches_used: 0,
+                max_size_bytes,
                 change_times: Arc::new(Mutex::new(HashMap::new())),
                 log_buffer,
                 watcher: Some(Box::new(watcher)),
@@ -151,6 +157,7 @@ impl Monitor {
             };
 
             monitor.log("Platform: macOS/BSD (FSEvents via notify)".to_string());
+            monitor.log(format!("Max file size: {} MB", max_size_mb));
             monitor.log(format!("  Watch budget: {} (FSEvents doesn't have hard limits)", watch_budget));
 
             Ok(monitor)
@@ -344,6 +351,11 @@ impl Monitor {
         let file_metadata = path.metadata()?;
 
         if !file_metadata.is_file() {
+            return Ok((false, None, false));
+        }
+
+        // Skip files that exceed size limit (consistent with initial snapshot)
+        if file_metadata.len() >= self.max_size_bytes {
             return Ok((false, None, false));
         }
 

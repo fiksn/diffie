@@ -21,14 +21,17 @@ struct Args {
     #[arg(short, long, help = "Append to existing snapshot file (scans subdirectory and merges)")]
     append: Option<String>,
 
-    #[arg(short, long, help = "Interactive mode: monitor changes in real-time using inotify (critical dirs) and mtime polling")]
+    #[arg(short, long, help = "Interactive mode: monitor changes in real-time using inotify (critical dirs) and polling")]
     interactive: bool,
 
-    #[arg(long, value_name = "DIR", num_args = 0.., default_values = DEFAULT_CRITICAL_DIRS, help = "Critical directories to watch with inotify")]
+    #[arg(long, value_name = "DIR", num_args = 0.., default_values = DEFAULT_CRITICAL_DIRS, help = "Critical directories to watch")]
     critical: Vec<String>,
 
-    #[arg(long, default_value = "30", help = "Polling interval in seconds for mtime checks")]
+    #[arg(long, default_value = "30", help = "Polling interval in seconds")]
     poll_interval: u64,
+
+    #[arg(long, default_value = "150", help = "Maximum file size in MB to include in snapshot")]
+    max_size: u64,
 }
 
 fn main() -> std::io::Result<()> {
@@ -77,7 +80,7 @@ fn main() -> std::io::Result<()> {
 
     if args.interactive {
         println!("\n=== Entering interactive mode ===");
-        run_interactive_mode(snapshot, &args.root, &output_file, args.critical, args.poll_interval)?;
+        run_interactive_mode(snapshot, &args.root, &output_file, args.critical, args.poll_interval, args.max_size)?;
     }
 
     Ok(())
@@ -89,6 +92,7 @@ fn run_interactive_mode(
     output_file: &str,
     critical_dirs: Vec<String>,
     poll_interval_secs: u64,
+    max_size_bytes: u64,
 ) -> std::io::Result<()> {
     let root_path = PathBuf::from(scan_root);
     let critical_paths = get_critical_dirs_in_scope(&root_path, &critical_dirs);
@@ -100,7 +104,7 @@ fn run_interactive_mode(
     println!("All other files will be polled every {} seconds", poll_interval_secs);
     println!("Press Ctrl+C to stop and save...\n");
 
-    let mut monitor = Monitor::new(snapshot, critical_paths, None)?;
+    let mut monitor = Monitor::new(snapshot, critical_paths, None, max_size_bytes)?;
     monitor.setup_watches(&root_path)?;
 
     let mut save_counter = 0;

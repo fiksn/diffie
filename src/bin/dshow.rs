@@ -413,7 +413,7 @@ fn main() -> Result<(), io::Error> {
             critical_paths.push(root_path.clone());
         }
 
-        let mut monitor = Monitor::new(reference_snapshot.clone(), critical_paths, Some(Arc::clone(&log_buffer)))?;
+        let mut monitor = Monitor::new(reference_snapshot.clone(), critical_paths, Some(Arc::clone(&log_buffer)), args.max_size)?;
         monitor.setup_watches(&root_path)?;
 
         let monitor_arc = Arc::new(Mutex::new(monitor));
@@ -497,7 +497,6 @@ fn main() -> Result<(), io::Error> {
                         }
                     }
 
-                    // Scan for new files that might not have been caught by FSEvents/inotify
                     let new_files = {
                         let monitor = monitor_bg.lock().unwrap();
                         monitor.scan_for_new_files()
