@@ -156,10 +156,25 @@ impl App {
                     let status = if let Some(old) = old_node {
                         if old.hash != node.hash {
                             DiffStatus::Modified
-                        } else if old.mode != node.mode || old.uid != node.uid || old.gid != node.gid {
-                            DiffStatus::PermChanged
                         } else {
-                            DiffStatus::Unchanged
+                            #[cfg(unix)]
+                            let metadata_changed = old.mode != node.mode
+                                || old.uid != node.uid
+                                || old.gid != node.gid
+                                || old.nlink != node.nlink
+                                || old.xattrs != node.xattrs;
+
+                            #[cfg(any(target_os = "macos", target_os = "linux"))]
+                            let metadata_changed = metadata_changed || old.flags != node.flags;
+
+                            #[cfg(not(unix))]
+                            let metadata_changed = false;
+
+                            if metadata_changed {
+                                DiffStatus::PermChanged
+                            } else {
+                                DiffStatus::Unchanged
+                            }
                         }
                     } else {
                         DiffStatus::Added
@@ -1105,6 +1120,45 @@ fn main() -> Result<(), io::Error> {
                         }
                         KeyCode::Up | KeyCode::Char('k') => {
                             app.log_selected = app.log_selected.saturating_sub(1);
+                        }
+                        KeyCode::PageDown => {
+                            let log = app.log_buffer.lock().unwrap();
+                            let max_idx = log.len().saturating_sub(1);
+                            drop(log);
+                            app.log_selected = (app.log_selected + 10).min(max_idx);
+                        }
+                        KeyCode::PageUp => {
+                            app.log_selected = app.log_selected.saturating_sub(10);
+                        }
+                        KeyCode::Enter => {
+                            // Try to extract file path from selected log entry and navigate to it
+                            let log = app.log_buffer.lock().unwrap();
+                            if app.log_selected < log.len() {
+                                let entry = &log[log.len() - 1 - app.log_selected]; // Reversed list
+                                let message = &entry.message;
+
+                                // Extract path from messages like "Created: /path/to/file" or "Modified: /path"
+                                let path_str = if let Some(colon_pos) = message.find(':') {
+                                    message[colon_pos + 1..].trim()
+                                } else {
+                                    ""
+                                };
+
+                                if !path_str.is_empty() {
+                                    let path = PathBuf::from(path_str);
+                                    // Navigate to parent directory if it's a file
+                                    if let Some(parent) = path.parent() {
+                                        if parent.starts_with(&app.navigation_root) {
+                                            drop(log);
+                                            app.current_dir = parent.to_path_buf();
+                                            app.selected = 0;
+                                            app.show_log = false;
+                                            app.log_selected = 0;
+                                        }
+                                    }
+                                }
+                            }
+                            drop(log);
                         }
                         KeyCode::Char('q') => break,
                         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
