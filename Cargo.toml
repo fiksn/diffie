@@ -18,7 +18,7 @@ clap = { version = "4", features = ["derive"] }
 crossterm = "0.29.0"
 notify = "8.2"
 num_cpus = "1.16"
-ratatui = "0.29.0"
+ratatui = "0.30.0"
 rayon = "1.11.0"
 serde = { version = "1.0.219", features = ["derive"] }
 sha2 = "0.10"
