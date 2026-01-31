@@ -4,7 +4,7 @@
 
 ## Intro
 
-Diffie is a simple (mostly vibecoded) forensics tool. The purpose of it is to highlight differences between files on a filesystem.
+Diffie is a simple (mostly vibecoded) forensics tool. The purpose is to highlight differences between files on a filesystem and ensure filesystem ensure integrity.
 Think of [Tripwire](https://github.com/Tripwire/tripwire-open-source) or [Aide](https://aide.github.io) just more modern and used mostly interactively.
 
 It consists of multiple binaries:
@@ -12,7 +12,7 @@ It consists of multiple binaries:
 * [dshow](./src/bin/dshow.rs)
 * [dwatch](./src/bin/dwatch.rs)
 
-and operates on the notion of `snapshots`. A snapshot contains metadata together with a unique checksum for every file - it currently uses "XXH3" which is a non-cryptographic hash function which on the other hand is very fast to compute ( [read more](https://xxhash.com)).
+and operates on the notion of `snapshots`. A snapshot contains metadata together with a unique checksum for every file - it currently uses "XXH3" which is a non-cryptographic hash function which on the other hand is very fast to compute ([read more](https://xxhash.com)).
 
 ## Usage
 

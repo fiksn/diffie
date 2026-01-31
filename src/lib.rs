@@ -1,11 +1,13 @@
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 use xxhash_rust::xxh3::Xxh3;
+use memmap2::Mmap;
 
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
@@ -137,11 +139,67 @@ pub struct FileNode {
     pub flags: u32,  // Linux file attributes (chattr)
 }
 
+pub const SNAPSHOT_VERSION: u32 = 1;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Snapshot {
+    /// Schema version for compatibility checking
+    pub version: u32,
+    /// SHA-256 checksum of the serialized nodes (for integrity verification)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checksum: Option<[u8; 32]>,
+    /// Unix timestamp when snapshot was created
     pub timestamp: i64,
+    /// Root path that was scanned
     pub root: PathBuf,
+    /// All file and directory nodes
     pub nodes: HashMap<PathBuf, FileNode>,
+}
+
+impl Snapshot {
+    /// Calculate SHA-256 checksum of the nodes HashMap
+    pub fn calculate_checksum(&self) -> [u8; 32] {
+        let nodes_bytes = bincode::serialize(&self.nodes).unwrap();
+        let mut hasher = Sha256::new();
+        hasher.update(&nodes_bytes);
+        hasher.finalize().into()
+    }
+
+    /// Verify the stored checksum matches the calculated one
+    pub fn verify_checksum(&self) -> Result<(), String> {
+        if let Some(stored_checksum) = &self.checksum {
+            let calculated = self.calculate_checksum();
+            if &calculated == stored_checksum {
+                Ok(())
+            } else {
+                Err(format!(
+                    "Checksum mismatch: stored {:02x?}, calculated {:02x?}",
+                    &stored_checksum[..8], &calculated[..8]
+                ))
+            }
+        } else {
+            // No checksum stored, skip validation
+            Ok(())
+        }
+    }
+
+    /// Check if snapshot version is compatible
+    pub fn check_version(&self) -> Result<(), String> {
+        if self.version > SNAPSHOT_VERSION {
+            Err(format!(
+                "Snapshot version {} is newer than supported version {}. Please upgrade diffie.",
+                self.version, SNAPSHOT_VERSION
+            ))
+        } else if self.version < SNAPSHOT_VERSION {
+            eprintln!(
+                "[WARN] Snapshot version {} is older than current version {}. Some features may not work correctly.",
+                self.version, SNAPSHOT_VERSION
+            );
+            Ok(())
+        } else {
+            Ok(())
+        }
+    }
 }
 
 pub fn hash_file(path: &Path) -> std::io::Result<u64> {
@@ -305,11 +363,19 @@ pub fn create_snapshot(
     let root_path = std::fs::canonicalize(root)
         .unwrap_or_else(|_| PathBuf::from(root));
 
-    Ok(Snapshot {
+    let mut snapshot = Snapshot {
+        version: SNAPSHOT_VERSION,
+        checksum: None,
         timestamp: jiff::Timestamp::now().as_second(),
         root: root_path,
         nodes: all_nodes,
-    })
+    };
+
+    // Calculate and store checksum
+    let checksum = snapshot.calculate_checksum();
+    snapshot.checksum = Some(checksum);
+
+    Ok(snapshot)
 }
 
 pub fn save_snapshot(snapshot: &Snapshot, filename: &str) -> std::io::Result<()> {
@@ -319,11 +385,42 @@ pub fn save_snapshot(snapshot: &Snapshot, filename: &str) -> std::io::Result<()>
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
 }
 
+/// Load snapshot using memory-mapped file for better performance with large snapshots
+/// This avoids loading the entire compressed data into memory before decompression
+pub fn load_snapshot_mmap(filename: &str) -> std::io::Result<Snapshot> {
+    let file = File::open(filename)?;
+    let mmap = unsafe { Mmap::map(&file)? };
+
+    let decompressed = zstd::decode_all(&mmap[..])?;
+    let snapshot: Snapshot = bincode::deserialize(&decompressed)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+
+    // Validate version
+    snapshot.check_version()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+    // Validate checksum
+    snapshot.verify_checksum()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+    Ok(snapshot)
+}
+
 pub fn load_snapshot(filename: &str) -> std::io::Result<Snapshot> {
     let file = File::open(filename)?;
     let decompressed = zstd::stream::read::Decoder::new(file)?;
-    bincode::deserialize_from(decompressed)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+    let snapshot: Snapshot = bincode::deserialize_from(decompressed)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+
+    // Validate version
+    snapshot.check_version()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+    // Validate checksum
+    snapshot.verify_checksum()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+    Ok(snapshot)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

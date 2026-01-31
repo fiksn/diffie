@@ -1,13 +1,15 @@
 use clap::Parser;
 use diffie::{
-    get_critical_dirs_in_scope, load_snapshot,
+    get_critical_dirs_in_scope, load_snapshot, load_snapshot_mmap,
     monitor::{Monitor, FileEvent}, DEFAULT_CRITICAL_DIRS,
 };
+use glob::Pattern;
+use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Parser)]
 #[command(name = "dwatch")]
@@ -37,10 +39,10 @@ struct Args {
     #[arg(long, help = "Number of threads for parallel verification (default: 90% of CPU cores)")]
     threads: Option<usize>,
 
-    #[arg(long, help = "Ignore changes to files matching these paths (can be specified multiple times)")]
+    #[arg(long, help = "Ignore changes to files matching these glob patterns (can be specified multiple times, e.g., '*.log', '/tmp/**')")]
     ignore_file: Vec<String>,
 
-    #[arg(long, help = "Ignore changes to files in these directories (can be specified multiple times)")]
+    #[arg(long, help = "Ignore changes to files in these directories (supports glob patterns, can be specified multiple times, e.g., '/var/cache', '/tmp/**')")]
     ignore_dir: Vec<String>,
 
     #[arg(long, help = "Save updated snapshot to this file on exit (SIGTERM/SIGINT)")]
@@ -48,35 +50,112 @@ struct Args {
 
     #[arg(long, help = "Suppress informational messages, only output changes")]
     quiet: bool,
+
+    #[arg(long, help = "Use memory-mapped file loading for large snapshots (reduces memory usage)")]
+    mmap: bool,
+
+    #[arg(long, value_name = "SECONDS", help = "Debounce time in seconds - only alert if file unchanged for this duration (reduces noise for frequently changing files)")]
+    debounce: Option<u64>,
 }
 
 struct IgnoreFilter {
-    files: Vec<PathBuf>,
-    dirs: Vec<PathBuf>,
+    file_patterns: Vec<Pattern>,
+    dir_patterns: Vec<Pattern>,
 }
 
 impl IgnoreFilter {
     fn new(ignore_files: Vec<String>, ignore_dirs: Vec<String>) -> Self {
+        let file_patterns = ignore_files
+            .into_iter()
+            .filter_map(|s| {
+                Pattern::new(&s).map_err(|e| {
+                    eprintln!("[WARN] Invalid file pattern '{}': {}", s, e);
+                    e
+                }).ok()
+            })
+            .collect();
+
+        let dir_patterns = ignore_dirs
+            .into_iter()
+            .filter_map(|s| {
+                Pattern::new(&s).map_err(|e| {
+                    eprintln!("[WARN] Invalid directory pattern '{}': {}", s, e);
+                    e
+                }).ok()
+            })
+            .collect();
+
         Self {
-            files: ignore_files.into_iter().map(PathBuf::from).collect(),
-            dirs: ignore_dirs.into_iter().map(PathBuf::from).collect(),
+            file_patterns,
+            dir_patterns,
         }
     }
 
     fn should_ignore(&self, path: &Path) -> bool {
-        // Check if path exactly matches an ignored file
-        if self.files.iter().any(|f| path == f) {
+        let path_str = path.to_string_lossy();
+
+        // Check if path matches any file glob pattern
+        if self.file_patterns.iter().any(|p| p.matches(&path_str)) {
             return true;
         }
 
-        // Check if path is within an ignored directory
-        for ignored_dir in &self.dirs {
-            if path.starts_with(ignored_dir) {
+        // Check if path is within any directory pattern
+        for dir_pattern in &self.dir_patterns {
+            // Try exact match first
+            if dir_pattern.matches(&path_str) {
+                return true;
+            }
+
+            // Check if path starts with the directory
+            // Convert glob pattern to prefix check
+            let pattern_str = dir_pattern.as_str();
+            // Remove trailing wildcards for prefix matching
+            let prefix = pattern_str.trim_end_matches("**").trim_end_matches('*');
+            if path_str.starts_with(prefix) {
                 return true;
             }
         }
 
         false
+    }
+}
+
+struct DebounceTracker {
+    pending: HashMap<PathBuf, (Instant, String)>,  // path -> (last_change_time, details)
+    debounce_duration: Duration,
+}
+
+impl DebounceTracker {
+    fn new(debounce_seconds: u64) -> Self {
+        Self {
+            pending: HashMap::new(),
+            debounce_duration: Duration::from_secs(debounce_seconds),
+        }
+    }
+
+    /// Record a change. Returns true if we should alert now (no debounce)
+    fn record_change(&mut self, path: PathBuf, details: String) -> bool {
+        self.pending.insert(path, (Instant::now(), details));
+        false  // Don't alert immediately when debouncing
+    }
+
+    /// Get changes that have been stable for debounce_duration
+    fn get_stable_changes(&mut self) -> Vec<(PathBuf, String)> {
+        let now = Instant::now();
+        let debounce_duration = self.debounce_duration;
+
+        let stable: Vec<(PathBuf, String)> = self.pending
+            .iter()
+            .filter(|(_, (last_change, _))| now.duration_since(*last_change) >= debounce_duration)
+            .map(|(path, (_, details))| (path.clone(), details.clone()))
+            .collect();
+
+        // Remove stable entries
+        for (path, _) in &stable {
+            self.pending.remove(path);
+        }
+
+        stable
     }
 }
 
@@ -112,7 +191,12 @@ fn main() -> io::Result<()> {
         .unwrap_or_else(|_| PathBuf::from(&args.path));
 
     output_info(&format!("Loading reference snapshot: {}", args.snapshot), args.quiet);
-    let reference_snapshot = load_snapshot(&args.snapshot)?;
+    let reference_snapshot = if args.mmap {
+        output_info("Using memory-mapped loading", args.quiet);
+        load_snapshot_mmap(&args.snapshot)?
+    } else {
+        load_snapshot(&args.snapshot)?
+    };
 
     output_info(&format!("Monitoring: {}", root_path.display()), args.quiet);
     output_info(&format!("Using {} threads for verification", num_threads), args.quiet);
@@ -136,6 +220,10 @@ fn main() -> io::Result<()> {
     output_info("Watch setup complete", args.quiet);
     output_info(&format!("Poll interval: {}s", args.poll_interval), args.quiet);
 
+    if let Some(debounce_secs) = args.debounce {
+        output_info(&format!("Debounce: {}s", debounce_secs), args.quiet);
+    }
+
     // Setup signal handling for graceful shutdown
     let running = Arc::new(Mutex::new(true));
     let running_clone = Arc::clone(&running);
@@ -150,6 +238,7 @@ fn main() -> io::Result<()> {
     let monitor_clone = Arc::clone(&monitor_arc);
     let poll_interval = args.poll_interval;
     let quiet = args.quiet;
+    let debounce_opt = args.debounce;
 
     // Spawn monitoring thread
     let ignore_filter_clone = IgnoreFilter::new(
@@ -159,6 +248,7 @@ fn main() -> io::Result<()> {
 
     thread::spawn(move || {
         let mut poll_counter = 0;
+        let mut debounce_tracker = debounce_opt.map(DebounceTracker::new);
 
         loop {
             // Check if we should exit
@@ -203,19 +293,32 @@ fn main() -> io::Result<()> {
                     if let Ok(results) = results {
                         for (path, updated, _, _, details) in results {
                             if updated && !details.is_empty() {
-                                output_change(&path, &details, &ignore_filter_clone, quiet);
+                                if let Some(ref mut tracker) = debounce_tracker {
+                                    // Record change, don't output yet
+                                    tracker.record_change(path, details);
+                                } else {
+                                    // No debounce, output immediately
+                                    output_change(&path, &details, &ignore_filter_clone, quiet);
+                                }
                             }
                         }
                     }
                 }
 
-                // Process removals
+                // Process removals (no debounce for removals - always immediate)
                 if !to_remove.is_empty() {
                     let monitor = monitor_clone.lock().unwrap();
                     for path in to_remove {
                         if monitor.remove_file(&path) {
                             output_change(&path, "removed", &ignore_filter_clone, quiet);
                         }
+                    }
+                }
+
+                // Check for stable changes (debounce)
+                if let Some(ref mut tracker) = debounce_tracker {
+                    for (path, details) in tracker.get_stable_changes() {
+                        output_change(&path, &details, &ignore_filter_clone, quiet);
                     }
                 }
             }
@@ -246,7 +349,11 @@ fn main() -> io::Result<()> {
                     if let Ok(results) = results {
                         for (path, updated, _, _, details) in results {
                             if updated && !details.is_empty() {
-                                output_change(&path, &details, &ignore_filter_clone, quiet);
+                                if let Some(ref mut tracker) = debounce_tracker {
+                                    tracker.record_change(path, details);
+                                } else {
+                                    output_change(&path, &details, &ignore_filter_clone, quiet);
+                                }
                             }
                         }
                     }
@@ -273,7 +380,11 @@ fn main() -> io::Result<()> {
                     if let Ok(results) = results {
                         for (path, updated, _, _, details) in results {
                             if updated && !details.is_empty() {
-                                output_change(&path, &details, &ignore_filter_clone, quiet);
+                                if let Some(ref mut tracker) = debounce_tracker {
+                                    tracker.record_change(path, details);
+                                } else {
+                                    output_change(&path, &details, &ignore_filter_clone, quiet);
+                                }
                             }
                         }
                     }

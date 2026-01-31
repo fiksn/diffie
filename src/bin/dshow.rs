@@ -5,8 +5,8 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use diffie::{
-    compute_sha256, get_critical_dirs_in_scope, get_xattrs_keys, load_snapshot, monitor::{Monitor, FileEvent},
-    save_snapshot, DiffNode, DiffStatus, LogEntry, Snapshot, DEFAULT_CRITICAL_DIRS,
+    compute_sha256, get_critical_dirs_in_scope, get_xattrs_keys, load_snapshot, load_snapshot_mmap,
+    monitor::{Monitor, FileEvent}, save_snapshot, DiffNode, DiffStatus, LogEntry, Snapshot, DEFAULT_CRITICAL_DIRS,
 };
 use ratatui::{
     backend::CrosstermBackend,
@@ -31,8 +31,8 @@ struct Args {
     #[arg(help = "Second snapshot file")]
     snapshot2: Option<String>,
 
-    #[arg(long, help = "Live monitoring mode: monitor path and show real-time changes")]
-    live: Option<String>,
+    #[arg(long, value_name = "PATH", help = "Live monitoring mode: monitor path and show real-time changes (defaults to / if not specified)")]
+    live: Option<Option<String>>,
 
     #[arg(long, help = "Persist changes to snapshot file on save (use with --live)")]
     persist: bool,
@@ -57,6 +57,9 @@ struct Args {
 
     #[arg(long, help = "Brief mode: print changes to stdout instead of launching TUI")]
     brief: bool,
+
+    #[arg(long, help = "Use memory-mapped file loading for large snapshots (reduces memory usage)")]
+    mmap: bool,
 }
 
 fn add_log_entry(log_buffer: &Arc<Mutex<Vec<LogEntry>>>, message: String) {
@@ -450,14 +453,19 @@ fn main() -> Result<(), io::Error> {
 
     let log_buffer = Arc::new(Mutex::new(Vec::new()));
 
-    let (old_snapshot, new_snapshot, live_mode, monitor, has_reference_snapshot) = if let Some(live_path) = &args.live {
+    let (old_snapshot, new_snapshot, live_mode, monitor, has_reference_snapshot) = if let Some(live_path_opt) = &args.live {
+        let live_path = live_path_opt.as_ref().map(|s| s.as_str()).unwrap_or("/");
         let root_path = PathBuf::from(live_path).canonicalize()
             .unwrap_or_else(|_| PathBuf::from(live_path));
 
         let has_ref = args.snapshot1.is_some();
 
         let reference_snapshot = if let Some(ref snap1) = args.snapshot1 {
-            load_snapshot(snap1)?
+            if args.mmap {
+                load_snapshot_mmap(snap1)?
+            } else {
+                load_snapshot(snap1)?
+            }
         } else {
             // Create an initial snapshot of the current state
             use diffie::create_snapshot;
@@ -630,8 +638,16 @@ fn main() -> Result<(), io::Error> {
         let snapshot2 = args.snapshot2.as_ref()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Must provide snapshot2 or --live"))?;
 
-        let old_snapshot = load_snapshot(snapshot1)?;
-        let new_snapshot = load_snapshot(snapshot2)?;
+        let old_snapshot = if args.mmap {
+            load_snapshot_mmap(snapshot1)?
+        } else {
+            load_snapshot(snapshot1)?
+        };
+        let new_snapshot = if args.mmap {
+            load_snapshot_mmap(snapshot2)?
+        } else {
+            load_snapshot(snapshot2)?
+        };
 
         // Determine the overlapping scope for comparison
         // Only compare files within the narrower of the two snapshot roots
@@ -715,7 +731,8 @@ fn main() -> Result<(), io::Error> {
     // Determine navigation root based on context
     let navigation_root = if live_mode && !has_reference_snapshot {
         // Pure live mode: use the live path as the navigation root
-        if let Some(live_path) = &args.live {
+        if let Some(live_path_opt) = &args.live {
+            let live_path = live_path_opt.as_ref().map(|s| s.as_str()).unwrap_or("/");
             PathBuf::from(live_path).canonicalize()
                 .unwrap_or_else(|_| PathBuf::from(live_path))
         } else {
