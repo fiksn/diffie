@@ -4,7 +4,7 @@
 
 ## Intro
 
-Diffie is a simple (mostly vibecoded) forensics tool. The purpose is to highlight which files are differents and ensure filesystem integrity.
+Diffie is a simple (mostly vibecoded) forensics tool. The purpose is to highlight which files are different and ensure filesystem integrity.
 Think of [Tripwire](https://github.com/Tripwire/tripwire-open-source) or [Aide](https://aide.github.io) just more modern and used mostly interactively.
 
 It consists of multiple binaries:
