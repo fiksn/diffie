@@ -389,8 +389,8 @@ impl Monitor {
                     changes.push("mtime");
                 }
 
-                let current_xattrs = crate::get_xattrs(path);
-                if existing.xattrs != current_xattrs {
+                let current_xattrs_hash = crate::get_xattrs_hash(path);
+                if existing.xattrs_hash != current_xattrs_hash {
                     changes.push("xattrs");
                 }
             }
@@ -434,7 +434,6 @@ impl Monitor {
             snapshot.nodes.insert(
                 path.to_path_buf(),
                 FileNode {
-                    path: path.to_path_buf(),
                     hash,
                     size: file_metadata.len(),
                     is_dir: false,
@@ -453,7 +452,7 @@ impl Monitor {
                     #[cfg(unix)]
                     nlink: file_metadata.nlink(),
                     #[cfg(unix)]
-                    xattrs: crate::get_xattrs(path),
+                    xattrs_hash: crate::get_xattrs_hash(path),
                     #[cfg(target_os = "macos")]
                     flags: file_metadata.st_flags(),
                     #[cfg(target_os = "linux")]
@@ -476,7 +475,8 @@ impl Monitor {
     }
 
     /// Batch update multiple files at once - much more efficient than calling update_file repeatedly
-    /// This hashes files in parallel, then locks once to update all files
+    /// This hashes files in parallel, then locks once to update all files, then recalculates
+    /// directory hashes bottom-up (deepest first) to avoid redundant work
     /// Returns (path, updated, change_time, content_changed, change_details)
     pub fn update_files_batch(&self, paths: Vec<PathBuf>) -> std::io::Result<Vec<(PathBuf, bool, Option<i64>, bool, String)>> {
         if paths.is_empty() {
@@ -504,7 +504,7 @@ impl Monitor {
             #[cfg(unix)]
             nlink: u64,
             #[cfg(unix)]
-            xattrs: HashMap<String, Vec<u8>>,
+            xattrs_hash: u64,
             #[cfg(target_os = "macos")]
             flags: u32,
             #[cfg(target_os = "linux")]
@@ -550,7 +550,7 @@ impl Monitor {
                     #[cfg(unix)]
                     nlink: metadata.nlink(),
                     #[cfg(unix)]
-                    xattrs: crate::get_xattrs(path),
+                    xattrs_hash: crate::get_xattrs_hash(path),
                     #[cfg(target_os = "macos")]
                     flags: metadata.st_flags(),
                     #[cfg(target_os = "linux")]
@@ -563,6 +563,8 @@ impl Monitor {
         let now = jiff::Timestamp::now().as_second();
         let mut snapshot = self.snapshot.lock().unwrap();
         let mut results = Vec::new();
+        let mut affected_dirs = HashSet::new();
+        let mut any_content_changed = false;
 
         for data_opt in file_data {
             if let Some(data) = data_opt {
@@ -589,7 +591,7 @@ impl Monitor {
                         if existing.mtime != data.mtime {
                             changes.push("mtime");
                         }
-                        if existing.xattrs != data.xattrs {
+                        if existing.xattrs_hash != data.xattrs_hash {
                             changes.push("xattrs");
                         }
                     }
@@ -632,7 +634,6 @@ impl Monitor {
                     snapshot.nodes.insert(
                         path.to_path_buf(),
                         FileNode {
-                            path: path.to_path_buf(),
                             hash: data.hash,
                             size: data.size,
                             is_dir: false,
@@ -651,7 +652,7 @@ impl Monitor {
                             #[cfg(unix)]
                             nlink: data.nlink,
                             #[cfg(unix)]
-                            xattrs: data.xattrs,
+                            xattrs_hash: data.xattrs_hash,
                             #[cfg(target_os = "macos")]
                             flags: data.flags,
                             #[cfg(target_os = "linux")]
@@ -659,13 +660,35 @@ impl Monitor {
                         },
                     );
 
-                    // Bubble up changes to parent directories
-                    self.recalculate_parent_hashes(&mut snapshot, path, content_changed, true);
+                    // Collect all parent directories that need recalculation
+                    let mut current = path.parent();
+                    while let Some(dir) = current {
+                        if !dir.starts_with(&snapshot.root) {
+                            break;
+                        }
+                        affected_dirs.insert(dir.to_path_buf());
+                        current = dir.parent();
+                    }
+
+                    if content_changed {
+                        any_content_changed = true;
+                    }
 
                     results.push((path.clone(), true, Some(now), content_changed, change_details));
                 } else {
                     results.push((path.clone(), false, None, false, String::new()));
                 }
+            }
+        }
+
+        // Recalculate directory hashes bottom-up (deepest first) - ONCE per directory
+        if !affected_dirs.is_empty() {
+            let mut dirs: Vec<PathBuf> = affected_dirs.into_iter().collect();
+            // Sort by depth descending (deepest directories first)
+            dirs.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
+
+            for dir in dirs {
+                self.recalculate_single_directory(&mut snapshot, &dir, any_content_changed, true, now);
             }
         }
 
@@ -684,6 +707,88 @@ impl Monitor {
         Ok(results)
     }
 
+    /// Recalculate hash for a single directory (called from batch operations)
+    fn recalculate_single_directory(
+        &self,
+        snapshot: &mut Snapshot,
+        dir: &Path,
+        content_changed: bool,
+        mark_for_change_time: bool,
+        now: i64,
+    ) {
+        let mut children: Vec<(&Path, &FileNode)> = snapshot
+            .nodes
+            .iter()
+            .filter(|(path, n)| {
+                if let Some(parent) = path.parent() {
+                    parent == dir && !n.is_dir
+                } else {
+                    false
+                }
+            })
+            .map(|(p, n)| (p.as_path(), n))
+            .collect();
+
+        if children.is_empty() {
+            return;
+        }
+
+        children.sort_by(|a, b| a.0.cmp(b.0));
+
+        if content_changed {
+            // Recalculate directory hash because child content changed
+            let hash = hash_directory(&children);
+            let size = children.iter().map(|n| n.1.size).sum();
+
+            let metadata = dir.metadata().ok();
+
+            // Check if hash actually changed before updating change_time
+            let hash_changed = snapshot.nodes.get(dir)
+                .map(|existing| existing.hash != hash)
+                .unwrap_or(true);
+
+            snapshot.nodes.insert(
+                dir.to_path_buf(),
+                FileNode {
+                    hash,
+                    size,
+                    is_dir: true,
+                    #[cfg(unix)]
+                    uid: metadata.as_ref().map(|m| m.uid()).unwrap_or(0),
+                    #[cfg(unix)]
+                    gid: metadata.as_ref().map(|m| m.gid()).unwrap_or(0),
+                    #[cfg(unix)]
+                    mode: metadata.as_ref().map(|m| m.mode()).unwrap_or(0),
+                    #[cfg(unix)]
+                    mtime: metadata.as_ref().map(|m| m.mtime()).unwrap_or(0),
+                    #[cfg(unix)]
+                    atime: metadata.as_ref().map(|m| m.atime()).unwrap_or(0),
+                    #[cfg(unix)]
+                    ctime: metadata.as_ref().map(|m| m.ctime()).unwrap_or(0),
+                    #[cfg(unix)]
+                    nlink: metadata.as_ref().map(|m| m.nlink()).unwrap_or(0),
+                    #[cfg(unix)]
+                    xattrs_hash: crate::get_xattrs_hash(dir),
+                    #[cfg(target_os = "macos")]
+                    flags: metadata.as_ref().map(|m| m.st_flags()).unwrap_or(0),
+                    #[cfg(target_os = "linux")]
+                    flags: crate::get_linux_flags(dir),
+                },
+            );
+
+            // Record change time for the directory if its hash changed
+            if hash_changed && mark_for_change_time {
+                let mut change_times = self.change_times.lock().unwrap();
+                change_times.insert(dir.to_path_buf(), now);
+            }
+        } else if mark_for_change_time {
+            // Content didn't change but metadata did (mtime, permissions, etc.)
+            // Don't recalculate hash, just mark directory as changed for ⚡ indicator
+            let mut change_times = self.change_times.lock().unwrap();
+            change_times.insert(dir.to_path_buf(), now);
+        }
+    }
+
     pub fn get_change_time(&self, path: &Path) -> Option<i64> {
         let change_times = self.change_times.lock().unwrap();
         change_times.get(path).copied()
@@ -692,6 +797,17 @@ impl Monitor {
     pub fn get_all_change_times(&self) -> HashMap<PathBuf, i64> {
         let change_times = self.change_times.lock().unwrap();
         change_times.clone()
+    }
+
+    /// Clean up old entries from change_times based on TTL (time-to-live in seconds)
+    /// Call this periodically to prevent unbounded memory growth
+    pub fn cleanup_old_change_times(&self, ttl_seconds: i64) {
+        let now = jiff::Timestamp::now().as_second();
+        let mut change_times = self.change_times.lock().unwrap();
+
+        change_times.retain(|_, &mut timestamp| {
+            (now - timestamp) <= ttl_seconds
+        });
     }
 
     pub fn remove_file(&self, path: &Path) -> bool {
@@ -723,25 +839,26 @@ impl Monitor {
                 break;
             }
 
-            let mut children: Vec<&FileNode> = snapshot
+            let mut children: Vec<(&Path, &FileNode)> = snapshot
                 .nodes
-                .values()
-                .filter(|n| {
-                    if let Some(parent) = n.path.parent() {
+                .iter()
+                .filter(|(path, n)| {
+                    if let Some(parent) = path.parent() {
                         parent == dir && !n.is_dir
                     } else {
                         false
                     }
                 })
+                .map(|(p, n)| (p.as_path(), n))
                 .collect();
 
             if !children.is_empty() {
-                children.sort_by(|a, b| a.path.cmp(&b.path));
+                children.sort_by(|a, b| a.0.cmp(b.0));
 
                 if content_changed {
                     // Recalculate directory hash because child content changed
                     let hash = hash_directory(&children);
-                    let size = children.iter().map(|n| n.size).sum();
+                    let size = children.iter().map(|n| n.1.size).sum();
 
                     let metadata = dir.metadata().ok();
 
@@ -753,7 +870,6 @@ impl Monitor {
                     snapshot.nodes.insert(
                         dir.to_path_buf(),
                         FileNode {
-                            path: dir.to_path_buf(),
                             hash,
                             size,
                             is_dir: true,
@@ -772,7 +888,7 @@ impl Monitor {
                             #[cfg(unix)]
                             nlink: metadata.as_ref().map(|m| m.nlink()).unwrap_or(0),
                             #[cfg(unix)]
-                            xattrs: crate::get_xattrs(dir),
+                            xattrs_hash: crate::get_xattrs_hash(dir),
                             #[cfg(target_os = "macos")]
                             flags: metadata.as_ref().map(|m| m.st_flags()).unwrap_or(0),
                             #[cfg(target_os = "linux")]
@@ -814,7 +930,7 @@ impl Monitor {
             #[cfg(unix)]
             nlink: u64,
             #[cfg(unix)]
-            xattrs_count: usize,  // Just count, not full HashMap
+            xattrs_hash: u64,
             #[cfg(any(target_os = "macos", target_os = "linux"))]
             flags: u32,
         }
@@ -838,7 +954,7 @@ impl Monitor {
                     #[cfg(unix)]
                     nlink: node.nlink,
                     #[cfg(unix)]
-                    xattrs_count: node.xattrs.len(),
+                    xattrs_hash: node.xattrs_hash,
                     #[cfg(any(target_os = "macos", target_os = "linux"))]
                     flags: node.flags,
                 })
@@ -873,18 +989,16 @@ impl Monitor {
                             has_changes = has_changes || current_flags != snap.flags;
                         }
 
+                        #[cfg(unix)]
+                        {
+                            if !has_changes {
+                                let current_xattrs_hash = crate::get_xattrs_hash(path);
+                                has_changes = current_xattrs_hash != snap.xattrs_hash;
+                            }
+                        }
+
                         #[cfg(not(unix))]
                         let has_changes = current_hash != snap.hash;
-
-                        // For xattrs, do a quick count check if nothing else changed
-                        // This avoids expensive cloning and comparison of xattr values
-                        #[cfg(unix)]
-                        let has_changes = if !has_changes {
-                            let current_xattrs = crate::get_xattrs(path);
-                            current_xattrs.len() != snap.xattrs_count
-                        } else {
-                            true
-                        };
 
                         if has_changes {
                             return Some(path.clone());

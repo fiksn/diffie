@@ -5,13 +5,14 @@
 ## Intro
 
 Diffie is a simple (mostly vibecoded) forensics tool. The purpose of it is to highlight differences between files on a filesystem.
-Think of TripWire just more modern and used interactively (not for triggering alerts).
+Think of [Tripwire](https://github.com/Tripwire/tripwire-open-source) or [Aide](https://aide.github.io) just more modern and used mostly interactively.
 
-It consists of two binaries:
+It consists of multiple binaries:
 * [dscan](./src/bin/dscan.rs)
 * [dshow](./src/bin/dshow.rs)
+* [dwatch](./src/bin/dwatch.rs)
 
-and operates on the notion of `snapshots`. A snapshot contains metadata together with a unique checksum for every file - it currently uses "XXH3" which is a non-cryptographically secure hash but is very fast to compute (see [https://xxhash.com](https://xxhash.com)).
+and operates on the notion of `snapshots`. A snapshot contains metadata together with a unique checksum for every file - it currently uses "XXH3" which is a non-cryptographic hash function which on the other hand is very fast to compute ( [read more](https://xxhash.com)).
 
 ## Usage
 
@@ -30,9 +31,11 @@ dshow --live /home/me
 
 in that case you get what was changed inside your home directory since the tool was started. You always have the option to press `S` and export the current state as a new snapshot that you can the compare later.
 
+Tool `dwatch` is basically `dshow` with `live mode` but without the TUI. Additionally you can pass what to ignore. The idea is that you can use it to script some alerting or IDS automatic with it.
+
 ## Events
 
-To detect changes as fast as possible in `live mode` `inotify` is used on Linux (however that is a bit cumbersome as it doesn't work recursively and we need to preserve fds). 
+To detect changes as fast as possible `inotify` is used on Linux (however that is a bit cumbersome as it doesn't work recursively and we need to preserve fds).
 On Mac/BSD `FSevents` are used for the same purpose (but since that works recursively we just add a watch on the root - your monitored directory and get changes almost immediately).
 In any case we still do periodic polling (and recalculating all the data).
 

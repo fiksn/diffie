@@ -5,7 +5,7 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use diffie::{
-    compute_sha256, get_critical_dirs_in_scope, load_snapshot, monitor::{Monitor, FileEvent},
+    compute_sha256, get_critical_dirs_in_scope, get_xattrs_keys, load_snapshot, monitor::{Monitor, FileEvent},
     save_snapshot, DiffNode, DiffStatus, LogEntry, Snapshot, DEFAULT_CRITICAL_DIRS,
 };
 use ratatui::{
@@ -165,7 +165,7 @@ impl App {
                                 || old.uid != node.uid
                                 || old.gid != node.gid
                                 || old.nlink != node.nlink
-                                || old.xattrs != node.xattrs;
+                                || old.xattrs_hash != node.xattrs_hash;
 
                             #[cfg(any(target_os = "macos", target_os = "linux"))]
                             let metadata_changed = metadata_changed || old.flags != node.flags;
@@ -437,6 +437,17 @@ fn main() -> Result<(), io::Error> {
         .build_global()
         .unwrap();
 
+    // Validate argument combinations
+    if args.live.is_some() && args.snapshot2.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Cannot use snapshot2 with --live mode. Valid usages:\n  \
+             1. Compare snapshots: dshow snapshot1 snapshot2\n  \
+             2. Live mode: dshow --live /path\n  \
+             3. Live with reference: dshow snapshot1 --live /path"
+        ));
+    }
+
     let log_buffer = Arc::new(Mutex::new(Vec::new()));
 
     let (old_snapshot, new_snapshot, live_mode, monitor, has_reference_snapshot) = if let Some(live_path) = &args.live {
@@ -481,42 +492,55 @@ fn main() -> Result<(), io::Error> {
                 thread::sleep(Duration::from_millis(100));
                 poll_counter += 1;
 
-                // Process inotify/FSEvents
-                {
+                // Process inotify/FSEvents - batch processing for efficiency
+                let fs_events = {
                     let monitor = monitor_clone.lock().unwrap();
-                    let fs_events = monitor.process_events();
-                    drop(monitor);
+                    monitor.process_events()
+                    // Lock automatically released here
+                };
+
+                if !fs_events.is_empty() {
+                    // Separate events into created/modified vs removed
+                    let mut to_update = Vec::new();
+                    let mut to_remove = Vec::new();
 
                     for event in fs_events {
                         match event {
-                            FileEvent::Created(path) => {
-                                let monitor = monitor_clone.lock().unwrap();
-                                let result = monitor.update_file(&path);
-                                drop(monitor);
-
-                                if let Ok((true, _, _, details)) = result {
-                                    add_log_entry(&log_clone, format!("Created ({}): {}", details, path.display()));
-                                }
-                            }
-                            FileEvent::Modified(path) => {
-                                let monitor = monitor_clone.lock().unwrap();
-                                let result = monitor.update_file(&path);
-                                drop(monitor);
-
-                                if let Ok((true, _, _, details)) = result {
-                                    add_log_entry(&log_clone, format!("Modified ({}): {}", details, path.display()));
-                                }
+                            FileEvent::Created(path) | FileEvent::Modified(path) => {
+                                to_update.push(path);
                             }
                             FileEvent::Removed(path) => {
-                                let monitor = monitor_clone.lock().unwrap();
-                                let removed = monitor.remove_file(&path);
-                                drop(monitor);
+                                to_remove.push(path);
+                            }
+                        }
+                    }
 
-                                if removed {
-                                    add_log_entry(&log_clone, format!("Removed: {}", path.display()));
+                    // Batch update all created/modified files at once
+                    if !to_update.is_empty() {
+                        let results = {
+                            let monitor = monitor_clone.lock().unwrap();
+                            monitor.update_files_batch(to_update)
+                            // Lock automatically released here
+                        };
+
+                        if let Ok(results) = results {
+                            for (path, updated, _, _, details) in results {
+                                if updated {
+                                    add_log_entry(&log_clone, format!("Updated ({}): {}", details, path.display()));
                                 }
                             }
                         }
+                    }
+
+                    // Process removals in batch (lock once for all removals)
+                    if !to_remove.is_empty() {
+                        let monitor = monitor_clone.lock().unwrap();
+                        for path in to_remove {
+                            if monitor.remove_file(&path) {
+                                add_log_entry(&log_clone, format!("Removed: {}", path.display()));
+                            }
+                        }
+                        // Lock automatically released here
                     }
                 }
 
@@ -580,6 +604,12 @@ fn main() -> Result<(), io::Error> {
                                 }
                             }
                         }
+                    }
+
+                    // Clean up old change_times entries (keep last 24 hours)
+                    {
+                        let monitor = monitor_bg.lock().unwrap();
+                        monitor.cleanup_old_change_times(86400); // 24 hours
                     }
 
                     let poll_duration = poll_start.elapsed();
@@ -647,7 +677,7 @@ fn main() -> Result<(), io::Error> {
                     if old_node.mtime != new_node.mtime {
                         changes.push("mtime");
                     }
-                    if old_node.xattrs != new_node.xattrs {
+                    if old_node.xattrs_hash != new_node.xattrs_hash {
                         changes.push("xattrs");
                     }
                 }
@@ -947,10 +977,17 @@ fn main() -> Result<(), io::Error> {
                         detail_lines.push(Line::from(vec![
                             Span::raw(format!("     flags:{}", format_flags(old.flags))),
                         ]));
-                        if !old.xattrs.is_empty() {
-                            detail_lines.push(Line::from(vec![
-                                Span::raw(format!("     xattrs: {}", old.xattrs.keys().map(|k| k.as_str()).collect::<Vec<_>>().join(", "))),
-                            ]));
+                        if old.xattrs_hash != 0 {
+                            let xattr_keys = get_xattrs_keys(&diff.path);
+                            if !xattr_keys.is_empty() {
+                                detail_lines.push(Line::from(vec![
+                                    Span::raw(format!("     xattrs: {}", xattr_keys.join(", "))),
+                                ]));
+                            } else {
+                                detail_lines.push(Line::from(vec![
+                                    Span::raw(format!("     xattrs_hash: {:016x}", old.xattrs_hash)),
+                                ]));
+                            }
                         }
                     }
 
@@ -991,10 +1028,17 @@ fn main() -> Result<(), io::Error> {
                         detail_lines.push(Line::from(vec![
                             Span::raw(format!("     flags:{}", format_flags(new.flags))),
                         ]));
-                        if !new.xattrs.is_empty() {
-                            detail_lines.push(Line::from(vec![
-                                Span::raw(format!("     xattrs: {}", new.xattrs.keys().map(|k| k.as_str()).collect::<Vec<_>>().join(", "))),
-                            ]));
+                        if new.xattrs_hash != 0 {
+                            let xattr_keys = get_xattrs_keys(&diff.path);
+                            if !xattr_keys.is_empty() {
+                                detail_lines.push(Line::from(vec![
+                                    Span::raw(format!("     xattrs: {}", xattr_keys.join(", "))),
+                                ]));
+                            } else {
+                                detail_lines.push(Line::from(vec![
+                                    Span::raw(format!("     xattrs_hash: {:016x}", new.xattrs_hash)),
+                                ]));
+                            }
                         }
                         if !new.is_dir {
                             if let Some(sha256) = app.sha256_cache.get(&diff.path) {

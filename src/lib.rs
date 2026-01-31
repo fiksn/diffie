@@ -48,22 +48,43 @@ pub fn get_critical_dirs_in_scope(scan_root: &Path, critical_dirs: &[String]) ->
         .collect()
 }
 
-// Helper function to get extended attributes
+// Helper function to get extended attributes hash
 #[cfg(unix)]
-pub fn get_xattrs(path: &Path) -> HashMap<String, Vec<u8>> {
-    let mut attrs = HashMap::new();
+pub fn get_xattrs_hash(path: &Path) -> u64 {
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut hasher = Xxh3::new();
 
     if let Ok(list) = xattr::list(path) {
-        for name in list {
+        let mut names: Vec<_> = list.collect();
+        names.sort(); // Ensure consistent ordering
+
+        for name in names {
             if let Ok(value) = xattr::get(path, &name) {
                 if let Some(data) = value {
-                    attrs.insert(name.to_string_lossy().to_string(), data);
+                    hasher.update(name.as_bytes());
+                    hasher.update(&data);
                 }
             }
         }
     }
 
-    attrs
+    hasher.digest()
+}
+
+// Helper function to get extended attributes keys for display
+#[cfg(unix)]
+pub fn get_xattrs_keys(path: &Path) -> Vec<String> {
+    let mut keys = Vec::new();
+
+    if let Ok(list) = xattr::list(path) {
+        for name in list {
+            keys.push(name.to_string_lossy().to_string());
+        }
+    }
+
+    keys.sort();
+    keys
 }
 
 // Helper function to get Linux file flags via ioctl
@@ -90,7 +111,6 @@ pub fn get_linux_flags(path: &Path) -> u32 {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FileNode {
-    pub path: PathBuf,
     pub hash: u64,
     pub size: u64,
     pub is_dir: bool,
@@ -103,13 +123,14 @@ pub struct FileNode {
     #[cfg(unix)]
     pub mtime: i64,
     #[cfg(unix)]
+    #[serde(skip, default)]
     pub atime: i64,
     #[cfg(unix)]
     pub ctime: i64,
     #[cfg(unix)]
     pub nlink: u64,
     #[cfg(unix)]
-    pub xattrs: HashMap<String, Vec<u8>>,
+    pub xattrs_hash: u64,
     #[cfg(target_os = "macos")]
     pub flags: u32,  // BSD st_flags (chflags)
     #[cfg(target_os = "linux")]
@@ -140,12 +161,12 @@ pub fn hash_file(path: &Path) -> std::io::Result<u64> {
     Ok(hasher.digest())
 }
 
-pub fn hash_directory(entries: &[&FileNode]) -> u64 {
+pub fn hash_directory(entries: &[(&Path, &FileNode)]) -> u64 {
     let mut hasher = Xxh3::new();
 
-    for entry in entries {
+    for (path, entry) in entries {
         hasher.update(&entry.hash.to_le_bytes());
-        hasher.update(entry.path.to_string_lossy().as_bytes());
+        hasher.update(path.to_string_lossy().as_bytes());
     }
 
     hasher.digest()
@@ -192,7 +213,6 @@ pub fn create_snapshot(
             Some((
                 path.clone(),
                 FileNode {
-                    path: path.clone(),
                     hash,
                     size: metadata.len(),
                     is_dir: false,
@@ -211,7 +231,7 @@ pub fn create_snapshot(
                     #[cfg(unix)]
                     nlink: metadata.nlink(),
                     #[cfg(unix)]
-                    xattrs: get_xattrs(path),
+                    xattrs_hash: get_xattrs_hash(path),
                     #[cfg(target_os = "macos")]
                     flags: metadata.st_flags(),
                     #[cfg(target_os = "linux")]
@@ -239,22 +259,21 @@ pub fn create_snapshot(
     dirs.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
 
     for dir_path in dirs {
-        let mut children: Vec<&FileNode> = dir_children[&dir_path]
+        let mut children: Vec<(&Path, &FileNode)> = dir_children[&dir_path]
             .iter()
-            .filter_map(|p| all_nodes.get(p))
+            .filter_map(|p| all_nodes.get(p).map(|n| (p.as_path(), n)))
             .collect();
 
-        children.sort_by(|a, b| a.path.cmp(&b.path));
+        children.sort_by(|a, b| a.0.cmp(b.0));
 
         let hash = hash_directory(&children);
-        let size = children.iter().map(|n| n.size).sum();
+        let size = children.iter().map(|n| n.1.size).sum();
 
         let metadata = dir_path.metadata().ok();
 
         all_nodes.insert(
             dir_path.clone(),
             FileNode {
-                path: dir_path.clone(),
                 hash,
                 size,
                 is_dir: true,
@@ -273,7 +292,7 @@ pub fn create_snapshot(
                 #[cfg(unix)]
                 nlink: metadata.as_ref().map(|m| m.nlink()).unwrap_or(0),
                 #[cfg(unix)]
-                xattrs: get_xattrs(&dir_path),
+                xattrs_hash: get_xattrs_hash(&dir_path),
                 #[cfg(target_os = "macos")]
                 flags: metadata.as_ref().map(|m| m.st_flags()).unwrap_or(0),
                 #[cfg(target_os = "linux")]
@@ -295,7 +314,7 @@ pub fn create_snapshot(
 
 pub fn save_snapshot(snapshot: &Snapshot, filename: &str) -> std::io::Result<()> {
     let file = File::create(filename)?;
-    let compressed = zstd::stream::write::Encoder::new(file, 3)?;
+    let compressed = zstd::stream::write::Encoder::new(file, 10)?;
     bincode::serialize_into(compressed, snapshot)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
 }
@@ -368,9 +387,9 @@ pub fn merge_snapshots(base: &mut Snapshot, new: &Snapshot) {
 
     let mut all_dirs: std::collections::HashSet<PathBuf> = base
         .nodes
-        .values()
-        .filter(|n| n.is_dir)
-        .map(|n| n.path.clone())
+        .iter()
+        .filter(|(_, n)| n.is_dir)
+        .map(|(p, _)| p.clone())
         .collect();
 
     for path in base.nodes.keys() {
@@ -382,34 +401,34 @@ pub fn merge_snapshots(base: &mut Snapshot, new: &Snapshot) {
     }
 
     let mut dirs: Vec<PathBuf> = all_dirs.into_iter().collect();
-    dirs.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
+    dirs.sort_by_key(|p: &PathBuf| std::cmp::Reverse(p.components().count()));
 
-    for dir_path in dirs {
-        let children: Vec<&FileNode> = base
+    for dir_path in &dirs {
+        let children: Vec<(&Path, &FileNode)> = base
             .nodes
-            .values()
-            .filter(|n| {
-                if let Some(parent) = n.path.parent() {
+            .iter()
+            .filter(|(path, n)| {
+                if let Some(parent) = path.parent() {
                     parent == dir_path && !n.is_dir
                 } else {
                     false
                 }
             })
+            .map(|(p, n)| (p.as_path(), n))
             .collect();
 
         if !children.is_empty() {
             let mut sorted_children = children;
-            sorted_children.sort_by(|a, b| a.path.cmp(&b.path));
+            sorted_children.sort_by(|a, b| a.0.cmp(b.0));
 
             let hash = hash_directory(&sorted_children);
-            let size = sorted_children.iter().map(|n| n.size).sum();
+            let size = sorted_children.iter().map(|n| n.1.size).sum();
 
-            let metadata = dir_path.metadata().ok();
+            let metadata: Option<std::fs::Metadata> = dir_path.metadata().ok();
 
             base.nodes.insert(
                 dir_path.clone(),
                 FileNode {
-                    path: dir_path.clone(),
                     hash,
                     size,
                     is_dir: true,
@@ -428,11 +447,11 @@ pub fn merge_snapshots(base: &mut Snapshot, new: &Snapshot) {
                     #[cfg(unix)]
                     nlink: metadata.as_ref().map(|m| m.nlink()).unwrap_or(0),
                     #[cfg(unix)]
-                    xattrs: get_xattrs(&dir_path),
+                    xattrs_hash: get_xattrs_hash(dir_path),
                     #[cfg(target_os = "macos")]
                     flags: metadata.as_ref().map(|m| m.st_flags()).unwrap_or(0),
                     #[cfg(target_os = "linux")]
-                    flags: get_linux_flags(&dir_path),
+                    flags: get_linux_flags(dir_path),
                 },
             );
         }
@@ -479,7 +498,7 @@ pub fn diff_snapshots(old: &Snapshot, new: &Snapshot) -> Vec<DiffNode> {
                 let hash_changed = old.hash != new.hash;
 
                 #[cfg(unix)]
-                let perm_changed = old.mode != new.mode || old.uid != new.uid || old.gid != new.gid;
+                let perm_changed = old.mode != new.mode || old.uid != new.uid || old.gid != new.gid || old.xattrs_hash != new.xattrs_hash;
                 #[cfg(not(unix))]
                 let perm_changed = false;
 

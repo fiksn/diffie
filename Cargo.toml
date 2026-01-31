@@ -11,7 +11,12 @@ path = "src/bin/dscan.rs"
 name = "dshow"
 path = "src/bin/dshow.rs"
 
+[[bin]]
+name = "dwatch"
+path = "src/bin/dwatch.rs"
+
 [dependencies]
+ctrlc = "3.4"
 bincode = "1.3.3"
 jiff = "0.2.15"
 clap = { version = "4", features = ["derive"] }
