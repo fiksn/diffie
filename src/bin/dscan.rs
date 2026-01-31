@@ -1,5 +1,5 @@
 use clap::Parser;
-use diffie::{create_snapshot, get_critical_dirs_in_scope, load_snapshot, merge_snapshots, monitor::{Monitor, FileEvent}, save_snapshot, DEFAULT_CRITICAL_DIRS};
+use diffie::{get_critical_dirs_in_scope, load_snapshot, merge_snapshots, monitor::{Monitor, FileEvent}, save_snapshot, DEFAULT_CRITICAL_DIRS};
 use std::path::PathBuf;
 use std::thread;
 use std::time::Duration;
@@ -41,7 +41,28 @@ fn main() -> std::io::Result<()> {
     println!("Skipping: {:?}", args.skip);
     println!("Max file size: {} MB", args.size);
 
-    let mut snapshot = create_snapshot(&args.root, &args.skip, args.size)?;
+    use diffie::create_snapshot_with_progress;
+    use std::sync::{Arc, Mutex};
+
+    let last_reported = Arc::new(Mutex::new(0));
+    let last_reported_clone = Arc::clone(&last_reported);
+
+    let mut snapshot = create_snapshot_with_progress(&args.root, &args.skip, args.size, Some(move |current, total| {
+        let mut last = last_reported_clone.lock().unwrap();
+        let percentage = (current * 100) / total;
+
+        // Report every 5% or at 100%
+        if percentage >= *last + 5 || percentage == 100 {
+            *last = percentage;
+            let bar_width = 50;
+            let filled = (bar_width * current) / total;
+            let bar: String = std::iter::repeat('█')
+                .take(filled)
+                .chain(std::iter::repeat('░').take(bar_width - filled))
+                .collect();
+            println!("Progress: [{}] {}%", bar, percentage);
+        }
+    }))?;
 
     let output_file = if let Some(append_file) = args.append.clone() {
         println!("\nLoading existing snapshot from: {}", append_file);

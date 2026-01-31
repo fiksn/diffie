@@ -1062,6 +1062,11 @@ impl Monitor {
         self.snapshot.lock().unwrap().clone()
     }
 
+    pub fn update_reference_snapshot(&mut self, new_snapshot: Snapshot) {
+        let mut snapshot = self.snapshot.lock().unwrap();
+        *snapshot = new_snapshot;
+    }
+
     /// Get only the nodes in a specific directory - much faster than cloning entire snapshot
     /// Returns (root_path, nodes_map) where nodes_map contains only files/dirs in the given directory
     pub fn get_directory_snapshot(&self, dir: &Path) -> (PathBuf, HashMap<PathBuf, crate::FileNode>) {

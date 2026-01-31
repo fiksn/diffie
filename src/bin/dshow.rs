@@ -87,10 +87,12 @@ struct App {
     sha256_cache: HashMap<PathBuf, String>, // Cache SHA256 hashes separately
     show_save_popup: bool,
     save_filename: String,
+    snapshot_ready: bool, // Track if initial snapshot creation is complete
+    snapshot_progress: Arc<Mutex<(usize, usize)>>, // (current, total) for initial scan
 }
 
 impl App {
-    fn new(old_snapshot: Snapshot, new_snapshot: Snapshot, live_mode: bool, monitor: Option<Arc<Mutex<Monitor>>>, navigation_root: PathBuf, log_buffer: Arc<Mutex<Vec<LogEntry>>>) -> Self {
+    fn new(old_snapshot: Snapshot, new_snapshot: Snapshot, live_mode: bool, monitor: Option<Arc<Mutex<Monitor>>>, navigation_root: PathBuf, log_buffer: Arc<Mutex<Vec<LogEntry>>>, snapshot_ready: bool, snapshot_progress: Arc<Mutex<(usize, usize)>>) -> Self {
         let current_dir = old_snapshot.root.clone();
         Self {
             old_snapshot,
@@ -109,6 +111,8 @@ impl App {
             sha256_cache: HashMap::new(),
             show_save_popup: false,
             save_filename: String::new(),
+            snapshot_ready,
+            snapshot_progress,
         }
     }
 
@@ -126,6 +130,80 @@ impl App {
         add_log_entry(&self.log_buffer, message);
     }
 
+    fn get_raw_filesystem_items(&self) -> Vec<DiffNode> {
+        // Raw filesystem listing - just show what's in the directory right now
+        let mut items = Vec::new();
+
+        // Add . (current directory)
+        items.push(DiffNode {
+            path: self.current_dir.clone(),
+            old_node: None,
+            new_node: None,
+            status: DiffStatus::Unchanged,
+            is_dir: true,
+            change_time: None,
+        });
+
+        // Add .. (parent directory) if not at navigation root
+        if let Some(parent) = self.current_dir.parent() {
+            if self.current_dir != self.navigation_root && parent >= self.navigation_root.as_path() {
+                items.push(DiffNode {
+                    path: parent.to_path_buf(),
+                    old_node: None,
+                    new_node: None,
+                    status: DiffStatus::Unchanged,
+                    is_dir: true,
+                    change_time: None,
+                });
+            }
+        }
+
+        // Read directory entries from filesystem
+        if let Ok(entries) = std::fs::read_dir(&self.current_dir) {
+            for entry in entries.filter_map(Result::ok) {
+                if let Ok(path) = entry.path().canonicalize() {
+                    if let Ok(metadata) = entry.metadata() {
+                        items.push(DiffNode {
+                            path,
+                            old_node: None,
+                            new_node: None,
+                            status: DiffStatus::Unchanged,
+                            is_dir: metadata.is_dir(),
+                            change_time: None,
+                        });
+                    }
+                }
+            }
+        }
+
+        // Sort: directories first, then by path
+        items.sort_by(|a, b| {
+            // Keep . and .. at the top
+            if a.path == self.current_dir {
+                return std::cmp::Ordering::Less;
+            }
+            if b.path == self.current_dir {
+                return std::cmp::Ordering::Greater;
+            }
+            if let Some(parent) = self.current_dir.parent() {
+                if a.path == parent {
+                    return std::cmp::Ordering::Less;
+                }
+                if b.path == parent {
+                    return std::cmp::Ordering::Greater;
+                }
+            }
+
+            match (a.is_dir, b.is_dir) {
+                (true, false) => std::cmp::Ordering::Less,
+                (false, true) => std::cmp::Ordering::Greater,
+                _ => a.path.cmp(&b.path),
+            }
+        });
+
+        items
+    }
+
     fn refresh_live_snapshot(&mut self) {
         // Don't refresh every frame - UI doesn't need full snapshot clone
         // The get_filtered_items will fetch what it needs directly from monitor
@@ -140,6 +218,11 @@ impl App {
     }
 
     fn get_filtered_items(&self) -> Vec<DiffNode> {
+        // If snapshot is not ready yet, show raw filesystem listing
+        if !self.snapshot_ready {
+            return self.get_raw_filesystem_items();
+        }
+
         // Get all items in the current directory from the new snapshot
         let mut items: Vec<DiffNode> = Vec::new();
 
@@ -453,27 +536,48 @@ fn main() -> Result<(), io::Error> {
 
     let log_buffer = Arc::new(Mutex::new(Vec::new()));
 
-    let (old_snapshot, new_snapshot, live_mode, monitor, has_reference_snapshot) = if let Some(live_path_opt) = &args.live {
+    let (old_snapshot, new_snapshot, live_mode, monitor, has_reference_snapshot, snapshot_ready, snapshot_progress) = if let Some(live_path_opt) = &args.live {
         let live_path = live_path_opt.as_ref().map(|s| s.as_str()).unwrap_or("/");
         let root_path = PathBuf::from(live_path).canonicalize()
             .unwrap_or_else(|_| PathBuf::from(live_path));
 
         let has_ref = args.snapshot1.is_some();
 
-        let reference_snapshot = if let Some(ref snap1) = args.snapshot1 {
-            if args.mmap {
+        let (reference_snapshot, snapshot_ready, snapshot_progress_arc, snapshot_handle_opt) = if let Some(ref snap1) = args.snapshot1 {
+            let snap = if args.mmap {
                 load_snapshot_mmap(snap1)?
             } else {
                 load_snapshot(snap1)?
-            }
+            };
+            (snap, true, Arc::new(Mutex::new((100, 100))), None)
         } else {
-            // Create an initial snapshot of the current state
-            use diffie::create_snapshot;
-            create_snapshot(
-                live_path,
-                &Vec::new(), // No skip dirs
-                args.max_size,
-            )?
+            // Create empty initial snapshot - will show raw filesystem until background scan completes
+            use diffie::create_snapshot_with_progress;
+
+            let empty_snapshot = Snapshot {
+                version: diffie::SNAPSHOT_VERSION,
+                checksum: None,
+                timestamp: jiff::Timestamp::now().as_second(),
+                root: root_path.clone(),
+                nodes: HashMap::new(),
+            };
+
+            // Setup progress tracking for TUI title
+            let progress = Arc::new(Mutex::new((0, 100)));
+            let progress_clone = Arc::clone(&progress);
+
+            // Start background thread to create snapshot with progress updates
+            let live_path_clone = live_path.to_string();
+            let max_size = args.max_size;
+
+            let snapshot_handle = thread::spawn(move || {
+                create_snapshot_with_progress(&live_path_clone, &Vec::new(), max_size, Some(move |current, total| {
+                    let mut p = progress_clone.lock().unwrap();
+                    *p = (current, total);
+                }))
+            });
+
+            (empty_snapshot, false, progress, Some(snapshot_handle))
         };
 
         let mut critical_paths = get_critical_dirs_in_scope(&root_path, &args.critical);
@@ -483,6 +587,7 @@ fn main() -> Result<(), io::Error> {
             critical_paths.push(root_path.clone());
         }
 
+        // Create monitor with initial (possibly empty) snapshot
         let mut monitor = Monitor::new(reference_snapshot.clone(), critical_paths, Some(Arc::clone(&log_buffer)), args.max_size)?;
         monitor.setup_watches(&root_path)?;
 
@@ -491,6 +596,32 @@ fn main() -> Result<(), io::Error> {
         let monitor_arc = Arc::new(Mutex::new(monitor));
         let monitor_clone = Arc::clone(&monitor_arc);
         let log_clone = Arc::clone(&log_buffer);
+
+        // If we have a background snapshot creation, update monitor when it completes
+        if let Some(snapshot_handle) = snapshot_handle_opt {
+            let monitor_for_snapshot = Arc::clone(&monitor_arc);
+            let log_for_snapshot = Arc::clone(&log_buffer);
+            let progress_for_check = Arc::clone(&snapshot_progress_arc);
+
+            thread::spawn(move || {
+                match snapshot_handle.join() {
+                    Ok(Ok(new_snapshot)) => {
+                        add_log_entry(&log_for_snapshot, "Initial snapshot complete".to_string());
+                        let mut monitor = monitor_for_snapshot.lock().unwrap();
+                        monitor.update_reference_snapshot(new_snapshot);
+                        // Mark as complete
+                        let mut p = progress_for_check.lock().unwrap();
+                        *p = (100, 100);
+                    }
+                    Ok(Err(e)) => {
+                        add_log_entry(&log_for_snapshot, format!("Snapshot creation failed: {}", e));
+                    }
+                    Err(_) => {
+                        add_log_entry(&log_for_snapshot, "Snapshot creation panicked".to_string());
+                    }
+                }
+            });
+        }
 
         let poll_interval = args.poll_interval;
         thread::spawn(move || {
@@ -631,7 +762,7 @@ fn main() -> Result<(), io::Error> {
             m.get_snapshot()
         };
 
-        (reference_snapshot, current_snapshot, true, Some(monitor_arc), has_ref)
+        (reference_snapshot, current_snapshot, true, Some(monitor_arc), has_ref, snapshot_ready, snapshot_progress_arc)
     } else {
         let snapshot1 = args.snapshot1.as_ref()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Must provide snapshot1 or --live"))?;
@@ -725,7 +856,7 @@ fn main() -> Result<(), io::Error> {
             }
         }
 
-        (old_snapshot, new_snapshot, false, None, true)
+        (old_snapshot, new_snapshot, false, None, true, true, Arc::new(Mutex::new((100, 100))))
     };
 
     // Determine navigation root based on context
@@ -805,13 +936,31 @@ fn main() -> Result<(), io::Error> {
         }
     };
 
-    let mut app = App::new(old_snapshot, new_snapshot, live_mode, monitor, navigation_root, log_buffer);
+    let mut app = App::new(old_snapshot, new_snapshot, live_mode, monitor, navigation_root, log_buffer, snapshot_ready, snapshot_progress);
     let persist = args.persist;
     let snapshot1_path = args.snapshot1.clone();
 
     loop {
         if app.live_mode {
             app.refresh_live_snapshot();
+
+            // Check if snapshot creation has completed
+            if !app.snapshot_ready {
+                let (current, total) = {
+                    let p = app.snapshot_progress.lock().unwrap();
+                    *p
+                };
+                if current >= total && total > 0 {
+                    app.snapshot_ready = true;
+                    // Update old_snapshot to match the completed initial snapshot
+                    // This way everything shows as "unchanged" initially
+                    if let Some(ref monitor_arc) = app.monitor {
+                        let monitor = monitor_arc.lock().unwrap();
+                        app.old_snapshot = monitor.get_snapshot();
+                    }
+                    app.add_log("Initial snapshot complete - tracking changes from this point".to_string());
+                }
+            }
         }
 
         let items = app.get_filtered_items();
@@ -912,11 +1061,25 @@ fn main() -> Result<(), io::Error> {
             };
 
             let title = if app.live_mode {
+                // Check if initial snapshot is still being created
+                let (current, total) = {
+                    let p = app.snapshot_progress.lock().unwrap();
+                    *p
+                };
+                let scan_status = if !app.snapshot_ready && total > 0 {
+                    let percentage = (current * 100) / total;
+                    format!("📊 Initial scan: {}% ", percentage)
+                } else if items.iter().any(|d| d.change_time.is_some()) {
+                    "⚡ monitoring ".to_string()
+                } else {
+                    "⚡ waiting ".to_string()
+                };
+
                 format!(
-                    "📂 {} | {} items | LIVE ⚡ {} | [t]ime:{} [↵]enter [←/backspace]up [s]ave [h]ash [l]og [u]nchanged [q/^C]uit",
+                    "📂 {} | {} items | LIVE {} | [t]ime:{} [↵]enter [←/backspace]up [s]ave [h]ash [l]og [u]nchanged [q/^C]uit",
                     current_dir_display,
                     items.len(),
-                    if items.iter().any(|d| d.change_time.is_some()) { "monitoring" } else { "waiting" },
+                    scan_status,
                     time_window_str
                 )
             } else {
