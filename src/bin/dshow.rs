@@ -60,6 +60,9 @@ struct Args {
 
     #[arg(long, help = "Use memory-mapped file loading for large snapshots (reduces memory usage)")]
     mmap: bool,
+
+    #[arg(long, help = "Disable periodic polling/scanning - rely only on inotify/FSEvents (faster but may miss changes outside watched directories)")]
+    no_scan: bool,
 }
 
 fn add_log_entry(log_buffer: &Arc<Mutex<Vec<LogEntry>>>, message: String) {
@@ -593,6 +596,33 @@ fn main() -> Result<(), io::Error> {
 
         add_log_entry(&log_buffer, format!("Using {} threads for parallel verification", num_threads));
 
+        // Check if watch budget was exceeded and warn the user
+        let (watches_used, watch_budget, watched_dirs) = monitor.get_watch_stats();
+        if monitor.is_watch_budget_exceeded() {
+            let warning = format!(
+                "⚠️  WARNING: inotify/FSEvents watch budget exceeded! ({}/{} watches used)",
+                watches_used, watch_budget
+            );
+            add_log_entry(&log_buffer, warning.clone());
+            add_log_entry(&log_buffer, format!("Only {} directories are being watched", watched_dirs));
+
+            if args.no_scan {
+                add_log_entry(&log_buffer,
+                    "⚠️  --no-scan enabled but not all directories can be watched!".to_string());
+                add_log_entry(&log_buffer,
+                    "Changes in unwatched directories will NOT be detected!".to_string());
+                add_log_entry(&log_buffer,
+                    "Consider removing --no-scan or increasing inotify limits.".to_string());
+            } else {
+                add_log_entry(&log_buffer,
+                    "Periodic polling will catch changes in unwatched directories.".to_string());
+            }
+        } else if args.no_scan {
+            add_log_entry(&log_buffer,
+                format!("--no-scan enabled: relying only on inotify/FSEvents ({}/{} watches)",
+                    watches_used, watch_budget));
+        }
+
         let monitor_arc = Arc::new(Mutex::new(monitor));
         let monitor_clone = Arc::clone(&monitor_arc);
         let log_clone = Arc::clone(&log_buffer);
@@ -624,6 +654,7 @@ fn main() -> Result<(), io::Error> {
         }
 
         let poll_interval = args.poll_interval;
+        let no_scan = args.no_scan;
         thread::spawn(move || {
             let mut poll_counter = 0;
             loop {
@@ -684,7 +715,8 @@ fn main() -> Result<(), io::Error> {
                 }
 
                 // Only do expensive polling operations every poll_interval seconds
-                if poll_counter * 100 < poll_interval * 1000 {
+                // Skip entirely if --no-scan is enabled
+                if no_scan || poll_counter * 100 < poll_interval * 1000 {
                     continue;
                 }
                 poll_counter = 0;

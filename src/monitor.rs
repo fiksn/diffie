@@ -1067,6 +1067,17 @@ impl Monitor {
         *snapshot = new_snapshot;
     }
 
+    /// Check if watch budget was exceeded during setup
+    pub fn is_watch_budget_exceeded(&self) -> bool {
+        self.watches_used >= self.watch_budget
+    }
+
+    /// Get watch statistics for reporting
+    pub fn get_watch_stats(&self) -> (usize, usize, usize) {
+        // Returns (watches_used, watch_budget, watched_dirs_count)
+        (self.watches_used, self.watch_budget, self.watched_dirs.len())
+    }
+
     /// Get only the nodes in a specific directory - much faster than cloning entire snapshot
     /// Returns (root_path, nodes_map) where nodes_map contains only files/dirs in the given directory
     pub fn get_directory_snapshot(&self, dir: &Path) -> (PathBuf, HashMap<PathBuf, crate::FileNode>) {

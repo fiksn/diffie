@@ -56,6 +56,9 @@ struct Args {
 
     #[arg(long, value_name = "SECONDS", help = "Debounce time in seconds - only alert if file unchanged for this duration (reduces noise for frequently changing files)")]
     debounce: Option<u64>,
+
+    #[arg(long, help = "Disable periodic polling/scanning - rely only on inotify/FSEvents (faster but may miss changes outside watched directories)")]
+    no_scan: bool,
 }
 
 struct IgnoreFilter {
@@ -217,6 +220,23 @@ fn main() -> io::Result<()> {
     )?;
     monitor.setup_watches(&root_path)?;
 
+    // Check if watch budget was exceeded and warn the user
+    let (watches_used, watch_budget, watched_dirs) = monitor.get_watch_stats();
+    if monitor.is_watch_budget_exceeded() {
+        eprintln!("⚠️  WARNING: inotify/FSEvents watch budget exceeded! ({}/{} watches used)", watches_used, watch_budget);
+        eprintln!("Only {} directories are being watched", watched_dirs);
+
+        if args.no_scan {
+            eprintln!("⚠️  --no-scan enabled but not all directories can be watched!");
+            eprintln!("Changes in unwatched directories will NOT be detected!");
+            eprintln!("Consider removing --no-scan or increasing inotify limits.");
+        } else {
+            eprintln!("Periodic polling will catch changes in unwatched directories.");
+        }
+    } else if args.no_scan {
+        output_info(&format!("--no-scan enabled: relying only on inotify/FSEvents ({}/{} watches)", watches_used, watch_budget), args.quiet);
+    }
+
     output_info("Watch setup complete", args.quiet);
     output_info(&format!("Poll interval: {}s", args.poll_interval), args.quiet);
 
@@ -239,6 +259,7 @@ fn main() -> io::Result<()> {
     let poll_interval = args.poll_interval;
     let quiet = args.quiet;
     let debounce_opt = args.debounce;
+    let no_scan = args.no_scan;
 
     // Spawn monitoring thread
     let ignore_filter_clone = IgnoreFilter::new(
@@ -324,7 +345,8 @@ fn main() -> io::Result<()> {
             }
 
             // Full verification every poll_interval seconds
-            if poll_counter * 100 < poll_interval * 1000 {
+            // Skip if --no-scan is enabled
+            if no_scan || poll_counter * 100 < poll_interval * 1000 {
                 continue;
             }
             poll_counter = 0;
