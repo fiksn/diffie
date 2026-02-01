@@ -5,18 +5,18 @@
 ## Intro
 
 Diffie is a simple (mostly vibecoded) forensics tool. The purpose is to highlight which files are different and ensure filesystem integrity.
-Think of [Tripwire](https://github.com/Tripwire/tripwire-open-source) or [Aide](https://aide.github.io) just more modern and used mostly interactively.
+Think of [Tripwire](https://github.com/Tripwire/tripwire-open-source) or [AIDE](https://aide.github.io) just more modern and used mostly interactively.
 
 It consists of multiple binaries:
 * [dscan](./src/bin/dscan.rs)
 * [dshow](./src/bin/dshow.rs)
 * [dwatch](./src/bin/dwatch.rs)
 
-and operates on the notion of `snapshots`. A snapshot contains metadata together with a unique checksum for every file - it currently uses "XXH3" which is a non-cryptographic hash function which on the other hand is very fast to compute ([read more](https://xxhash.com)). Note that no file content is stored but the snapshot can still get very big.
+and operates on the notion of `snapshots`. A snapshot contains metadata together with a unique checksum for every file - it currently uses "XXH3" which is a non-cryptographic hash function which on the other hand is very fast to compute ([read more](https://xxhash.com)). Note that no file content is stored but the snapshot can still get very big. Imagine the filesystem being a big Merkle tree.
 
 ## Usage
 
-Using `dscan` you can crate a snapshot of the filesystem below some directory (or root directory by default).
+Using `dscan` you can crate a snapshot of the filesystem below some directory (or / by default).
 
 Then `dshow` is a TUI file explorer using which you navigate the filesystem and search for differences (or press `L` to see a log of what is going on currently and all changed files).
 The tool `dshow` can be invoked between old and new snapshot but it supports also a `live mode`. When you call it with:

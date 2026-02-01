@@ -408,6 +408,11 @@ impl Monitor {
                 if existing.flags != current_flags {
                     changes.push("flags");
                 }
+
+                let current_lsm = crate::get_lsm_context(path);
+                if existing.lsm_context != current_lsm {
+                    changes.push("lsm");
+                }
             }
 
             let metadata = !changes.is_empty();
@@ -453,6 +458,8 @@ impl Monitor {
                     nlink: file_metadata.nlink().min(u16::MAX as u64) as u16,
                     #[cfg(unix)]
                     xattrs_hash: crate::get_xattrs_hash(path),
+                    #[cfg(target_os = "linux")]
+                    lsm_context: crate::get_lsm_context(path),
                     #[cfg(target_os = "macos")]
                     flags: file_metadata.st_flags(),
                     #[cfg(target_os = "linux")]
@@ -505,6 +512,8 @@ impl Monitor {
             nlink: u16,
             #[cfg(unix)]
             xattrs_hash: u64,
+            #[cfg(target_os = "linux")]
+            lsm_context: Option<String>,
             #[cfg(target_os = "macos")]
             flags: u32,
             #[cfg(target_os = "linux")]
@@ -551,6 +560,8 @@ impl Monitor {
                     nlink: metadata.nlink().min(u16::MAX as u64) as u16,
                     #[cfg(unix)]
                     xattrs_hash: crate::get_xattrs_hash(path),
+                    #[cfg(target_os = "linux")]
+                    lsm_context: crate::get_lsm_context(path),
                     #[cfg(target_os = "macos")]
                     flags: metadata.st_flags(),
                     #[cfg(target_os = "linux")]
@@ -608,6 +619,10 @@ impl Monitor {
                         if existing.flags != data.flags {
                             changes.push("flags");
                         }
+
+                        if existing.lsm_context != data.lsm_context {
+                            changes.push("lsm");
+                        }
                     }
 
                     let metadata = !changes.is_empty();
@@ -653,6 +668,8 @@ impl Monitor {
                             nlink: data.nlink,
                             #[cfg(unix)]
                             xattrs_hash: data.xattrs_hash,
+                            #[cfg(target_os = "linux")]
+                            lsm_context: data.lsm_context,
                             #[cfg(target_os = "macos")]
                             flags: data.flags,
                             #[cfg(target_os = "linux")]
@@ -769,6 +786,8 @@ impl Monitor {
                     nlink: metadata.as_ref().map(|m| m.nlink().min(u16::MAX as u64) as u16).unwrap_or(0),
                     #[cfg(unix)]
                     xattrs_hash: crate::get_xattrs_hash(dir),
+                    #[cfg(target_os = "linux")]
+                    lsm_context: crate::get_lsm_context(dir),
                     #[cfg(target_os = "macos")]
                     flags: metadata.as_ref().map(|m| m.st_flags()).unwrap_or(0),
                     #[cfg(target_os = "linux")]
@@ -889,6 +908,8 @@ impl Monitor {
                             nlink: metadata.as_ref().map(|m| m.nlink().min(u16::MAX as u64) as u16).unwrap_or(0),
                             #[cfg(unix)]
                             xattrs_hash: crate::get_xattrs_hash(dir),
+                            #[cfg(target_os = "linux")]
+                            lsm_context: crate::get_lsm_context(dir),
                             #[cfg(target_os = "macos")]
                             flags: metadata.as_ref().map(|m| m.st_flags()).unwrap_or(0),
                             #[cfg(target_os = "linux")]
@@ -994,6 +1015,14 @@ impl Monitor {
                             if !has_changes {
                                 let current_xattrs_hash = crate::get_xattrs_hash(path);
                                 has_changes = current_xattrs_hash != snap.xattrs_hash;
+                            }
+                        }
+
+                        #[cfg(target_os = "linux")]
+                        {
+                            if !has_changes {
+                                let current_lsm = crate::get_lsm_context(path);
+                                has_changes = current_lsm != snap.lsm_context;
                             }
                         }
 

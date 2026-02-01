@@ -88,6 +88,39 @@ pub fn get_xattrs_keys(path: &Path) -> Vec<String> {
     keys
 }
 
+// Helper function to get LSM (Linux Security Module) context
+// Checks for SELinux first, then AppArmor (they're mutually exclusive)
+#[cfg(target_os = "linux")]
+pub fn get_lsm_context(path: &Path) -> Option<String> {
+    use std::os::unix::ffi::OsStrExt;
+
+    // Try SELinux first
+    if let Ok(Some(value)) = xattr::get(path, "security.selinux") {
+        let context = value.iter()
+            .take_while(|&&b| b != 0)
+            .copied()
+            .collect::<Vec<u8>>();
+
+        if let Ok(ctx) = String::from_utf8(context) {
+            return Some(ctx);
+        }
+    }
+
+    // Try AppArmor
+    if let Ok(Some(value)) = xattr::get(path, "security.apparmor") {
+        let context = value.iter()
+            .take_while(|&&b| b != 0)
+            .copied()
+            .collect::<Vec<u8>>();
+
+        if let Ok(ctx) = String::from_utf8(context) {
+            return Some(ctx);
+        }
+    }
+
+    None
+}
+
 // Helper function to get Linux file flags via ioctl
 #[cfg(target_os = "linux")]
 pub fn get_linux_flags(path: &Path) -> u32 {
@@ -132,6 +165,8 @@ pub struct FileNode {
     pub nlink: u16,
     #[cfg(unix)]
     pub xattrs_hash: u64,
+    #[cfg(target_os = "linux")]
+    pub lsm_context: Option<String>,  // SELinux or AppArmor context
     #[cfg(target_os = "macos")]
     pub flags: u32,  // BSD st_flags (chflags)
     #[cfg(target_os = "linux")]
@@ -294,6 +329,8 @@ where
                     nlink: metadata.nlink().min(u16::MAX as u64) as u16,
                     #[cfg(unix)]
                     xattrs_hash: get_xattrs_hash(path),
+                    #[cfg(target_os = "linux")]
+                    lsm_context: get_lsm_context(path),
                     #[cfg(target_os = "macos")]
                     flags: metadata.st_flags(),
                     #[cfg(target_os = "linux")]
@@ -371,6 +408,8 @@ where
                 nlink: metadata.as_ref().map(|m| m.nlink().min(u16::MAX as u64) as u16).unwrap_or(0),
                 #[cfg(unix)]
                 xattrs_hash: get_xattrs_hash(&dir_path),
+                #[cfg(target_os = "linux")]
+                lsm_context: get_lsm_context(&dir_path),
                 #[cfg(target_os = "macos")]
                 flags: metadata.as_ref().map(|m| m.st_flags()).unwrap_or(0),
                 #[cfg(target_os = "linux")]
@@ -572,6 +611,8 @@ pub fn merge_snapshots(base: &mut Snapshot, new: &Snapshot) {
                     nlink: metadata.as_ref().map(|m| m.nlink().min(u16::MAX as u64) as u16).unwrap_or(0),
                     #[cfg(unix)]
                     xattrs_hash: get_xattrs_hash(dir_path),
+                    #[cfg(target_os = "linux")]
+                    lsm_context: get_lsm_context(dir_path),
                     #[cfg(target_os = "macos")]
                     flags: metadata.as_ref().map(|m| m.st_flags()).unwrap_or(0),
                     #[cfg(target_os = "linux")]
@@ -621,8 +662,10 @@ pub fn diff_snapshots(old: &Snapshot, new: &Snapshot) -> Vec<DiffNode> {
             (Some(old), Some(new)) => {
                 let hash_changed = old.hash != new.hash;
 
-                #[cfg(unix)]
+                #[cfg(all(unix, not(target_os = "linux")))]
                 let perm_changed = old.mode != new.mode || old.uid != new.uid || old.gid != new.gid || old.xattrs_hash != new.xattrs_hash;
+                #[cfg(target_os = "linux")]
+                let perm_changed = old.mode != new.mode || old.uid != new.uid || old.gid != new.gid || old.xattrs_hash != new.xattrs_hash || old.lsm_context != new.lsm_context;
                 #[cfg(not(unix))]
                 let perm_changed = false;
 

@@ -263,6 +263,9 @@ impl App {
                             #[cfg(any(target_os = "macos", target_os = "linux"))]
                             let metadata_changed = metadata_changed || old.flags != node.flags;
 
+                            #[cfg(target_os = "linux")]
+                            let metadata_changed = metadata_changed || old.lsm_context != node.lsm_context;
+
                             #[cfg(not(unix))]
                             let metadata_changed = false;
 
@@ -894,6 +897,13 @@ fn main() -> Result<(), io::Error> {
                     }
                 }
 
+                #[cfg(target_os = "linux")]
+                {
+                    if old_node.lsm_context != new_node.lsm_context {
+                        changes.push("lsm");
+                    }
+                }
+
                 if !changes.is_empty() {
                     let details = changes.join("+");
                     add_log_entry(&log_buffer, format!("Modified ({}): {}", details, path.display()));
@@ -1227,6 +1237,12 @@ fn main() -> Result<(), io::Error> {
                                 ]));
                             }
                         }
+                        #[cfg(target_os = "linux")]
+                        if let Some(ref ctx) = old.lsm_context {
+                            detail_lines.push(Line::from(vec![
+                                Span::raw(format!("     lsm: {}", ctx)),
+                            ]));
+                        }
                     }
 
                     if let Some(new) = &diff.new_node {
@@ -1277,6 +1293,12 @@ fn main() -> Result<(), io::Error> {
                                     Span::raw(format!("     xattrs_hash: {:016x}", new.xattrs_hash)),
                                 ]));
                             }
+                        }
+                        #[cfg(target_os = "linux")]
+                        if let Some(ref ctx) = new.lsm_context {
+                            detail_lines.push(Line::from(vec![
+                                Span::raw(format!("     lsm: {}", ctx)),
+                            ]));
                         }
                         if !new.is_dir {
                             // Build hash line with all available hashes
