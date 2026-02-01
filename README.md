@@ -29,9 +29,9 @@ You can use the tool also without an old snapshot like:
 dshow --live /home/me
 ```
 
-in that case you get what was changed inside your home directory since the tool was started. You always have the option to press `S` and export the current state as a new snapshot that you can the compare later.
+in that case you get what was changed inside your home directory since the tool was started. You always have the option to press `S` and export the current state as a new snapshot that you can then use later.
 
-Tool `dwatch` is basically `dshow` with `live mode` but without the TUI. Additionally you can pass what to ignore. The idea is that you can use it to script some alerting and create some sort of simple IDS from it.
+Tool `dwatch` is basically `dshow` with `live mode` but without the TUI. Additionally you can pass what file or directory wildcards to ignore. The idea is that you can use it to script some alerting and create some sort of simple IDS from it.
 
 ## Events
 
