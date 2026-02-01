@@ -382,7 +382,7 @@ impl Monitor {
                 if existing.gid != file_metadata.gid() {
                     changes.push("gid");
                 }
-                if existing.nlink != file_metadata.nlink() {
+                if existing.nlink != file_metadata.nlink().min(u16::MAX as u64) as u16 {
                     changes.push("nlink");
                 }
                 if existing.mtime != file_metadata.mtime() {
@@ -450,7 +450,7 @@ impl Monitor {
                     #[cfg(unix)]
                     ctime: file_metadata.ctime(),
                     #[cfg(unix)]
-                    nlink: file_metadata.nlink(),
+                    nlink: file_metadata.nlink().min(u16::MAX as u64) as u16,
                     #[cfg(unix)]
                     xattrs_hash: crate::get_xattrs_hash(path),
                     #[cfg(target_os = "macos")]
@@ -502,7 +502,7 @@ impl Monitor {
             #[cfg(unix)]
             ctime: i64,
             #[cfg(unix)]
-            nlink: u64,
+            nlink: u16,
             #[cfg(unix)]
             xattrs_hash: u64,
             #[cfg(target_os = "macos")]
@@ -548,7 +548,7 @@ impl Monitor {
                     #[cfg(unix)]
                     ctime: metadata.ctime(),
                     #[cfg(unix)]
-                    nlink: metadata.nlink(),
+                    nlink: metadata.nlink().min(u16::MAX as u64) as u16,
                     #[cfg(unix)]
                     xattrs_hash: crate::get_xattrs_hash(path),
                     #[cfg(target_os = "macos")]
@@ -766,7 +766,7 @@ impl Monitor {
                     #[cfg(unix)]
                     ctime: metadata.as_ref().map(|m| m.ctime()).unwrap_or(0),
                     #[cfg(unix)]
-                    nlink: metadata.as_ref().map(|m| m.nlink()).unwrap_or(0),
+                    nlink: metadata.as_ref().map(|m| m.nlink().min(u16::MAX as u64) as u16).unwrap_or(0),
                     #[cfg(unix)]
                     xattrs_hash: crate::get_xattrs_hash(dir),
                     #[cfg(target_os = "macos")]
@@ -886,7 +886,7 @@ impl Monitor {
                             #[cfg(unix)]
                             ctime: metadata.as_ref().map(|m| m.ctime()).unwrap_or(0),
                             #[cfg(unix)]
-                            nlink: metadata.as_ref().map(|m| m.nlink()).unwrap_or(0),
+                            nlink: metadata.as_ref().map(|m| m.nlink().min(u16::MAX as u64) as u16).unwrap_or(0),
                             #[cfg(unix)]
                             xattrs_hash: crate::get_xattrs_hash(dir),
                             #[cfg(target_os = "macos")]
@@ -928,7 +928,7 @@ impl Monitor {
             #[cfg(unix)]
             gid: u32,
             #[cfg(unix)]
-            nlink: u64,
+            nlink: u16,
             #[cfg(unix)]
             xattrs_hash: u64,
             #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -976,7 +976,7 @@ impl Monitor {
                             || metadata.mode() != snap.mode
                             || metadata.uid() != snap.uid
                             || metadata.gid() != snap.gid
-                            || metadata.nlink() != snap.nlink;
+                            || metadata.nlink().min(u16::MAX as u64) as u16 != snap.nlink;
 
                         #[cfg(target_os = "macos")]
                         {

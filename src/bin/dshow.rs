@@ -88,6 +88,8 @@ struct App {
     show_log: bool,
     log_selected: usize,
     sha256_cache: HashMap<PathBuf, String>, // Cache SHA256 hashes separately
+    md5_cache: HashMap<PathBuf, String>, // Cache MD5 hashes separately
+    blake3_cache: HashMap<PathBuf, String>, // Cache BLAKE3 hashes separately
     show_save_popup: bool,
     save_filename: String,
     snapshot_ready: bool, // Track if initial snapshot creation is complete
@@ -112,6 +114,8 @@ impl App {
             show_log: false,
             log_selected: 0,
             sha256_cache: HashMap::new(),
+            md5_cache: HashMap::new(),
+            blake3_cache: HashMap::new(),
             show_save_popup: false,
             save_filename: String::new(),
             snapshot_ready,
@@ -432,22 +436,45 @@ impl App {
 
             if !item.is_dir && item.path.exists() {
                 let path = item.path.clone();
-                self.add_log(format!("Computing SHA-256 for: {}", path.display()));
+                self.add_log(format!("Computing hashes for: {}", path.display()));
 
+                // Compute SHA-256
                 match compute_sha256(&path) {
                     Ok(hash) => {
-                        // Store the hash in the separate cache
                         self.sha256_cache.insert(path.clone(), hash.clone());
-                        self.add_log(format!("SHA-256 computed: {} = {}", path.display(), hash));
-                        self.show_hash_popup = true;
+                        self.add_log(format!("SHA-256: {}", hash));
                     }
                     Err(e) => {
-                        // Store the error in the cache
                         self.sha256_cache.insert(path.clone(), format!("Error: {}", e));
-                        self.add_log(format!("SHA-256 error for {}: {}", path.display(), e));
-                        self.show_hash_popup = true;
+                        self.add_log(format!("SHA-256 error: {}", e));
                     }
                 }
+
+                // Compute MD5
+                match diffie::compute_md5(&path) {
+                    Ok(hash) => {
+                        self.md5_cache.insert(path.clone(), hash.clone());
+                        self.add_log(format!("MD5: {}", hash));
+                    }
+                    Err(e) => {
+                        self.md5_cache.insert(path.clone(), format!("Error: {}", e));
+                        self.add_log(format!("MD5 error: {}", e));
+                    }
+                }
+
+                // Compute BLAKE3
+                match diffie::compute_blake3(&path) {
+                    Ok(hash) => {
+                        self.blake3_cache.insert(path.clone(), hash.clone());
+                        self.add_log(format!("BLAKE3: {}", hash));
+                    }
+                    Err(e) => {
+                        self.blake3_cache.insert(path.clone(), format!("Error: {}", e));
+                        self.add_log(format!("BLAKE3 error: {}", e));
+                    }
+                }
+
+                self.show_hash_popup = true;
             }
         }
     }
@@ -559,7 +586,6 @@ fn main() -> Result<(), io::Error> {
 
             let empty_snapshot = Snapshot {
                 version: diffie::SNAPSHOT_VERSION,
-                checksum: None,
                 timestamp: jiff::Timestamp::now().as_second(),
                 root: root_path.clone(),
                 nodes: HashMap::new(),
@@ -1253,9 +1279,20 @@ fn main() -> Result<(), io::Error> {
                             }
                         }
                         if !new.is_dir {
+                            // Build hash line with all available hashes
+                            let mut hash_parts = Vec::new();
                             if let Some(sha256) = app.sha256_cache.get(&diff.path) {
+                                hash_parts.push(format!("sha256:{}", sha256));
+                            }
+                            if let Some(md5) = app.md5_cache.get(&diff.path) {
+                                hash_parts.push(format!("md5:{}", md5));
+                            }
+                            if let Some(blake3) = app.blake3_cache.get(&diff.path) {
+                                hash_parts.push(format!("blake3:{}", blake3));
+                            }
+                            if !hash_parts.is_empty() {
                                 detail_lines.push(Line::from(vec![
-                                    Span::raw(format!("     sha256:{}", sha256)),
+                                    Span::raw(format!("     {}", hash_parts.join("  "))),
                                 ]));
                             }
                         }
@@ -1275,8 +1312,8 @@ fn main() -> Result<(), io::Error> {
 
             // Render hash popup overlay if enabled
             if app.show_hash_popup {
-                let popup_width = 70u16.min(f.area().width.saturating_sub(6));
-                let popup_height = 8u16.min(f.area().height.saturating_sub(6));
+                let popup_width = 80u16.min(f.area().width.saturating_sub(6));
+                let popup_height = 16u16.min(f.area().height.saturating_sub(6));
 
                 let popup_area = ratatui::layout::Rect {
                     x: (f.area().width.saturating_sub(popup_width)) / 2,
@@ -1304,15 +1341,35 @@ fn main() -> Result<(), io::Error> {
 
                 if app.selected < items.len() {
                     let item_path = &items[app.selected].path;
+
+                    // SHA-256
                     if let Some(hash) = app.sha256_cache.get(item_path) {
                         popup_lines.push(Line::from(vec![
-                            Span::styled("SHA256:", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+                            Span::styled("SHA-256:", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
                         ]));
                         popup_lines.push(Line::from(Span::raw(hash.clone())));
+                        popup_lines.push(Line::from(""));
+                    }
+
+                    // MD5
+                    if let Some(hash) = app.md5_cache.get(item_path) {
+                        popup_lines.push(Line::from(vec![
+                            Span::styled("MD5:", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+                        ]));
+                        popup_lines.push(Line::from(Span::raw(hash.clone())));
+                        popup_lines.push(Line::from(""));
+                    }
+
+                    // BLAKE3
+                    if let Some(hash) = app.blake3_cache.get(item_path) {
+                        popup_lines.push(Line::from(vec![
+                            Span::styled("BLAKE3:", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+                        ]));
+                        popup_lines.push(Line::from(Span::raw(hash.clone())));
+                        popup_lines.push(Line::from(""));
                     }
                 }
 
-                popup_lines.push(Line::from(""));
                 popup_lines.push(Line::from(vec![
                     Span::styled("[Press any key to close]", Style::default().fg(Color::DarkGray)),
                 ]));
@@ -1320,7 +1377,7 @@ fn main() -> Result<(), io::Error> {
                 let popup = Paragraph::new(popup_lines)
                     .block(
                         Block::default()
-                            .title("SHA256 Hash")
+                            .title("File Hashes")
                             .borders(Borders::ALL)
                             .border_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
                             .style(Style::default().bg(Color::Black))

@@ -1,6 +1,5 @@
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, Read};
@@ -130,7 +129,7 @@ pub struct FileNode {
     #[cfg(unix)]
     pub ctime: i64,
     #[cfg(unix)]
-    pub nlink: u64,
+    pub nlink: u16,
     #[cfg(unix)]
     pub xattrs_hash: u64,
     #[cfg(target_os = "macos")]
@@ -145,9 +144,6 @@ pub const SNAPSHOT_VERSION: u32 = 1;
 pub struct Snapshot {
     /// Schema version for compatibility checking
     pub version: u32,
-    /// SHA-256 checksum of the serialized nodes (for integrity verification)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub checksum: Option<[u8; 32]>,
     /// Unix timestamp when snapshot was created
     pub timestamp: i64,
     /// Root path that was scanned
@@ -157,22 +153,6 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
-    /// Calculate SHA-256 checksum of the nodes HashMap
-    pub fn calculate_checksum(&self) -> [u8; 32] {
-        let nodes_bytes = bincode::serialize(&self.nodes).unwrap();
-        let mut hasher = Sha256::new();
-        hasher.update(&nodes_bytes);
-        hasher.finalize().into()
-    }
-
-    /// Verify the stored checksum matches the calculated one
-    pub fn verify_checksum(&self) -> Result<(), String> {
-        // Checksum verification disabled due to non-deterministic bincode serialization
-        // and atime field skipping causing mismatches
-        // TODO: Re-enable with a more robust checksum mechanism in future versions
-        Ok(())
-    }
-
     /// Check if snapshot version is compatible
     pub fn check_version(&self) -> Result<(), String> {
         if self.version > SNAPSHOT_VERSION {
@@ -311,7 +291,7 @@ where
                     #[cfg(unix)]
                     ctime: metadata.ctime(),
                     #[cfg(unix)]
-                    nlink: metadata.nlink(),
+                    nlink: metadata.nlink().min(u16::MAX as u64) as u16,
                     #[cfg(unix)]
                     xattrs_hash: get_xattrs_hash(path),
                     #[cfg(target_os = "macos")]
@@ -386,7 +366,7 @@ where
                 #[cfg(unix)]
                 ctime: metadata.as_ref().map(|m| m.ctime()).unwrap_or(0),
                 #[cfg(unix)]
-                nlink: metadata.as_ref().map(|m| m.nlink()).unwrap_or(0),
+                nlink: metadata.as_ref().map(|m| m.nlink().min(u16::MAX as u64) as u16).unwrap_or(0),
                 #[cfg(unix)]
                 xattrs_hash: get_xattrs_hash(&dir_path),
                 #[cfg(target_os = "macos")]
@@ -406,17 +386,12 @@ where
     let root_path = std::fs::canonicalize(root)
         .unwrap_or_else(|_| PathBuf::from(root));
 
-    let mut snapshot = Snapshot {
+    let snapshot = Snapshot {
         version: SNAPSHOT_VERSION,
-        checksum: None,
         timestamp: jiff::Timestamp::now().as_second(),
         root: root_path,
         nodes: all_nodes,
     };
-
-    // Calculate and store checksum
-    let checksum = snapshot.calculate_checksum();
-    snapshot.checksum = Some(checksum);
 
     // Report progress: complete (100%)
     if let Some(ref cb) = progress_callback {
@@ -449,10 +424,6 @@ pub fn load_snapshot_mmap(filename: &str) -> std::io::Result<Snapshot> {
     snapshot.check_version()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
-    // Validate checksum
-    snapshot.verify_checksum()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-
     Ok(snapshot)
 }
 
@@ -464,10 +435,6 @@ pub fn load_snapshot(filename: &str) -> std::io::Result<Snapshot> {
 
     // Validate version
     snapshot.check_version()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-
-    // Validate checksum
-    snapshot.verify_checksum()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
     Ok(snapshot)
@@ -592,7 +559,7 @@ pub fn merge_snapshots(base: &mut Snapshot, new: &Snapshot) {
                     #[cfg(unix)]
                     ctime: metadata.as_ref().map(|m| m.ctime()).unwrap_or(0),
                     #[cfg(unix)]
-                    nlink: metadata.as_ref().map(|m| m.nlink()).unwrap_or(0),
+                    nlink: metadata.as_ref().map(|m| m.nlink().min(u16::MAX as u64) as u16).unwrap_or(0),
                     #[cfg(unix)]
                     xattrs_hash: get_xattrs_hash(dir_path),
                     #[cfg(target_os = "macos")]
@@ -696,4 +663,40 @@ pub fn compute_sha256(path: &Path) -> std::io::Result<String> {
     }
 
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+pub fn compute_md5(path: &Path) -> std::io::Result<String> {
+    use md5::{Md5, Digest};
+
+    let file = File::open(path)?;
+    let mut reader = BufReader::new(file);
+    let mut hasher = Md5::new();
+    let mut buffer = [0u8; 65536];
+
+    loop {
+        let n = reader.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buffer[..n]);
+    }
+
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+pub fn compute_blake3(path: &Path) -> std::io::Result<String> {
+    let file = File::open(path)?;
+    let mut reader = BufReader::new(file);
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = [0u8; 65536];
+
+    loop {
+        let n = reader.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buffer[..n]);
+    }
+
+    Ok(hasher.finalize().to_hex().to_string())
 }
