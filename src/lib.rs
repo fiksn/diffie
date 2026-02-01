@@ -309,16 +309,18 @@ where
     }
 
     let mut all_nodes = file_nodes.clone();
+
+    // Build parent-child relationships for directories
+    // Each directory should only include its DIRECT children (files + subdirs)
     let mut dir_children: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
 
+    // Add file children - files only know their immediate parent
     for file_path in file_nodes.keys() {
-        let mut current = file_path.parent();
-        while let Some(dir) = current {
+        if let Some(parent) = file_path.parent() {
             dir_children
-                .entry(dir.to_path_buf())
+                .entry(parent.to_path_buf())
                 .or_insert_with(Vec::new)
                 .push(file_path.clone());
-            current = dir.parent();
         }
     }
 
@@ -375,6 +377,14 @@ where
                 flags: get_linux_flags(&dir_path),
             },
         );
+
+        // Add this directory as a child to its parent (for proper merkle tree)
+        if let Some(parent) = dir_path.parent() {
+            dir_children
+                .entry(parent.to_path_buf())
+                .or_insert_with(Vec::new)
+                .push(dir_path.clone());
+        }
     }
 
     // Report progress: finalizing (95%)
