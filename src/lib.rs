@@ -92,7 +92,6 @@ pub fn get_xattrs_keys(path: &Path) -> Vec<String> {
 // Checks for SELinux first, then AppArmor (they're mutually exclusive)
 #[cfg(target_os = "linux")]
 pub fn get_lsm_context(path: &Path) -> Option<String> {
-    use std::os::unix::ffi::OsStrExt;
 
     // Try SELinux first
     if let Ok(Some(value)) = xattr::get(path, "security.selinux") {
@@ -715,7 +714,8 @@ pub fn compute_sha256(path: &Path) -> std::io::Result<String> {
         hasher.update(&buffer[..n]);
     }
 
-    Ok(format!("{:x}", hasher.finalize()))
+    let result = hasher.finalize();
+    Ok(result.iter().map(|b| format!("{:02x}", b)).collect())
 }
 
 pub fn compute_md5(path: &Path) -> std::io::Result<String> {
@@ -734,7 +734,8 @@ pub fn compute_md5(path: &Path) -> std::io::Result<String> {
         hasher.update(&buffer[..n]);
     }
 
-    Ok(format!("{:x}", hasher.finalize()))
+    let result = hasher.finalize();
+    Ok(result.iter().map(|b| format!("{:02x}", b)).collect())
 }
 
 pub fn compute_blake3(path: &Path) -> std::io::Result<String> {

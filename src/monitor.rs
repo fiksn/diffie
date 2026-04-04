@@ -1,4 +1,6 @@
 use crate::{hash_directory, hash_file, FileNode, LogEntry, Snapshot};
+
+#[cfg(all(unix, not(target_os = "linux")))]
 use notify::{Watcher, RecursiveMode, Event, EventKind};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
@@ -6,7 +8,9 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+#[cfg(all(unix, not(target_os = "linux")))]
 use std::sync::mpsc::{channel, Receiver};
+use std::cell::RefCell;
 
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
@@ -25,7 +29,7 @@ pub enum FileEvent {
 }
 
 #[cfg(target_os = "linux")]
-use inotify::{Inotify, WatchMask};
+use inotify::{Inotify, WatchMask, EventMask};
 
 #[derive(Debug, Clone)]
 pub struct InotifyLimits {
@@ -59,7 +63,7 @@ impl InotifyLimits {
         })
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(all(unix, not(target_os = "linux")))]
     pub fn read_from_procfs() -> std::io::Result<Self> {
         Ok(InotifyLimits {
             max_user_watches: 0,
@@ -81,12 +85,12 @@ pub struct Monitor {
     change_times: Arc<Mutex<HashMap<PathBuf, i64>>>,
     log_buffer: Option<Arc<Mutex<Vec<LogEntry>>>>,
     #[cfg(target_os = "linux")]
-    inotify: Option<Inotify>,
+    inotify: Option<RefCell<Inotify>>,
     #[cfg(target_os = "linux")]
     watch_map: HashMap<i32, PathBuf>, // Map watch descriptor to directory path
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(all(unix, not(target_os = "linux")))]
     watcher: Option<Box<dyn Watcher + Send>>,
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(all(unix, not(target_os = "linux")))]
     event_rx: Option<Receiver<Result<Event, notify::Error>>>,
 }
 
@@ -108,7 +112,7 @@ impl Monitor {
 
         #[cfg(target_os = "linux")]
         {
-            let inotify = Some(Inotify::init()?);
+            let inotify = Some(RefCell::new(Inotify::init()?));
             let limits = InotifyLimits::read_from_procfs()?;
             let watch_budget = (limits.max_user_watches as f64 * 0.7) as usize;
 
@@ -136,7 +140,7 @@ impl Monitor {
             Ok(monitor)
         }
 
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(all(unix, not(target_os = "linux")))]
         {
             let watch_budget = 10000;
 
@@ -173,7 +177,8 @@ impl Monitor {
 
         let mut log_messages = Vec::new();
 
-        if let Some(ref mut inotify) = self.inotify {
+        if let Some(ref inotify) = self.inotify {
+            let inotify = inotify.borrow_mut();
             let watch_mask = WatchMask::MODIFY
                 | WatchMask::CREATE
                 | WatchMask::DELETE
@@ -237,7 +242,7 @@ impl Monitor {
         Ok(())
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(all(unix, not(target_os = "linux")))]
     pub fn setup_watches(&mut self, scan_root: &Path) -> std::io::Result<()> {
         // macOS FSEvents: One recursive watch on root covers everything
         self.log(format!("Setting up FSEvents watch on: {}", scan_root.display()));
@@ -268,6 +273,7 @@ impl Monitor {
         let mut events = Vec::new();
 
         if let Some(ref inotify) = self.inotify {
+            let mut inotify = inotify.borrow_mut();
             let mut buffer = [0u8; 4096];
             // Use read_events_blocking with a zero timeout for non-blocking read
             match inotify.read_events(&mut buffer) {
@@ -285,13 +291,13 @@ impl Monitor {
                                 dir_path.clone()
                             };
 
-                            if event.mask.contains(WatchMask::DELETE) || event.mask.contains(WatchMask::DELETE_SELF) {
+                            if event.mask.contains(EventMask::DELETE) || event.mask.contains(EventMask::DELETE_SELF) {
                                 events.push(FileEvent::Removed(path));
-                            } else if event.mask.contains(WatchMask::CREATE) {
+                            } else if event.mask.contains(EventMask::CREATE) {
                                 if path.is_file() {
                                     events.push(FileEvent::Created(path));
                                 }
-                            } else if event.mask.contains(WatchMask::MODIFY) || event.mask.contains(WatchMask::ATTRIB) {
+                            } else if event.mask.contains(EventMask::MODIFY) || event.mask.contains(EventMask::ATTRIB) {
                                 if path.is_file() {
                                     events.push(FileEvent::Modified(path));
                                 }
@@ -308,7 +314,7 @@ impl Monitor {
         events
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(all(unix, not(target_os = "linux")))]
     pub fn process_events(&self) -> Vec<FileEvent> {
         let mut events = Vec::new();
 
@@ -954,6 +960,8 @@ impl Monitor {
             xattrs_hash: u64,
             #[cfg(any(target_os = "macos", target_os = "linux"))]
             flags: u32,
+            #[cfg(target_os = "linux")]
+            lsm_context: Option<String>,
         }
 
         // Lock briefly to get minimal comparison data, then release
@@ -978,6 +986,8 @@ impl Monitor {
                     xattrs_hash: node.xattrs_hash,
                     #[cfg(any(target_os = "macos", target_os = "linux"))]
                     flags: node.flags,
+                    #[cfg(target_os = "linux")]
+                    lsm_context: node.lsm_context.clone(),
                 })
                 .collect()
         };
@@ -1047,7 +1057,7 @@ impl Monitor {
     #[cfg(target_os = "linux")]
     pub fn scan_for_new_files(&self) -> std::io::Result<Vec<PathBuf>> {
         // Lock briefly to get list of directories to scan, then release
-        let (watch_root, dirs): (PathBuf, Vec<PathBuf>) = {
+        let (_watch_root, dirs): (PathBuf, Vec<PathBuf>) = {
             let snapshot = self.snapshot.lock().unwrap();
             let root = snapshot.root.clone();
             let dirs = snapshot.nodes.iter()
@@ -1081,7 +1091,7 @@ impl Monitor {
         Ok(new_files)
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(all(unix, not(target_os = "linux")))]
     pub fn scan_for_new_files(&self) -> std::io::Result<Vec<PathBuf>> {
         // macOS FSEvents covers everything recursively, so scanning is redundant
         Ok(Vec::new())
