@@ -133,7 +133,7 @@ pub fn get_linux_flags(path: &Path) -> u32 {
         let mut flags: libc::c_long = 0;
 
         unsafe {
-            if libc::ioctl(fd, FS_IOC_GETFLAGS, &mut flags) == 0 {
+            if libc::ioctl(fd, FS_IOC_GETFLAGS as _, &mut flags) == 0 {
                 return flags as u32;
             }
         }
