@@ -10,7 +10,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 #[cfg(all(unix, not(target_os = "linux")))]
 use std::sync::mpsc::{channel, Receiver};
-use std::cell::RefCell;
 
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
