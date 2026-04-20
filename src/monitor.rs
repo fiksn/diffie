@@ -1,5 +1,6 @@
 use crate::{hash_directory, hash_file, FileNode, LogEntry, Snapshot};
 
+use std::cell::RefCell;
 #[cfg(all(unix, not(target_os = "linux")))]
 use notify::{Watcher, RecursiveMode, Event, EventKind};
 use rayon::prelude::*;

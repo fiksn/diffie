@@ -75,6 +75,7 @@
             pkgs.pkg-config
             pkgs.openssl
             pkgs.git
+            pkgs.acl
           ] ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
             pkgs.libiconv
           ];
