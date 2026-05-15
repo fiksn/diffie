@@ -29,7 +29,7 @@ struct Args {
         value_name = "DIR",
         num_args = 0..,
         default_values = DEFAULT_CRITICAL_DIRS,
-        help = "Critical directories to watch with inotify/FSEvents"
+        help = "Critical directories to watch with fanotify/inotify/FSEvents"
     )]
     critical: Vec<String>,
 
@@ -57,7 +57,7 @@ struct Args {
     #[arg(long, value_name = "SECONDS", help = "Debounce time in seconds - only alert if file unchanged for this duration (reduces noise for frequently changing files)")]
     debounce: Option<u64>,
 
-    #[arg(long, help = "Disable periodic polling/scanning - rely only on inotify/FSEvents (faster but may miss changes outside watched directories)")]
+    #[arg(long, help = "Disable periodic polling/scanning - rely only on fanotify/inotify/FSEvents (faster but may miss changes outside watched directories)")]
     no_scan: bool,
 }
 
@@ -223,7 +223,7 @@ fn main() -> io::Result<()> {
     // Check if watch budget was exceeded and warn the user
     let (watches_used, watch_budget, watched_dirs) = monitor.get_watch_stats();
     if monitor.is_watch_budget_exceeded() {
-        eprintln!("⚠️  WARNING: inotify/FSEvents watch budget exceeded! ({}/{} watches used)", watches_used, watch_budget);
+        eprintln!("⚠️  WARNING: fanotify/inotify/FSEvents watch budget exceeded! ({}/{} watches used)", watches_used, watch_budget);
         eprintln!("Only {} directories are being watched", watched_dirs);
 
         if args.no_scan {
@@ -234,7 +234,7 @@ fn main() -> io::Result<()> {
             eprintln!("Periodic polling will catch changes in unwatched directories.");
         }
     } else if args.no_scan {
-        output_info(&format!("--no-scan enabled: relying only on inotify/FSEvents ({}/{} watches)", watches_used, watch_budget), args.quiet);
+        output_info(&format!("--no-scan enabled: relying only on fanotify/inotify/FSEvents ({}/{} watches)", watches_used, watch_budget), args.quiet);
     }
 
     output_info("Watch setup complete", args.quiet);
@@ -283,7 +283,7 @@ fn main() -> io::Result<()> {
             thread::sleep(Duration::from_millis(100));
             poll_counter += 1;
 
-            // Process FSEvents/inotify every 100ms
+            // Process fanotify/inotify/FSEvents every 100ms
             let fs_events = {
                 let monitor = monitor_clone.lock().unwrap();
                 monitor.process_events()

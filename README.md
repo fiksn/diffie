@@ -35,7 +35,7 @@ Tool `dwatch` is basically `dshow` with `live mode` but without the TUI. Additio
 
 ## Events
 
-To detect changes as fast as possible `inotify` is used on Linux (however that is a bit cumbersome as it doesn't work recursively and we need to preserve fds).
+To detect changes as fast as possible `inotify` is used on Linux (however that is a bit cumbersome as it doesn't work recursively and we need to preserve fds). If you run as root we use `fanotify` therefore.
 On Mac/BSD `FSevents` are used for the same purpose (but since that works recursively we just add a watch on the root of your monitored directory hierarchy and get changes almost immediately).
 In any case we still do periodic polling (and recalculate all the data).
 

@@ -1,13 +1,20 @@
 use crate::{hash_directory, hash_file, FileNode, LogEntry, Snapshot};
 
+#[cfg(target_os = "linux")]
 use std::cell::RefCell;
 #[cfg(all(unix, not(target_os = "linux")))]
 use notify::{Watcher, RecursiveMode, Event, EventKind};
+#[cfg(target_os = "linux")]
+use nix::sys::fanotify::{EventFFlags, Fanotify, InitFlags, MarkFlags, MaskFlags};
+#[cfg(target_os = "linux")]
+use nix::unistd::Uid;
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 #[allow(unused_imports)]
 use std::fs;
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
 use std::sync::{Arc, Mutex};
 #[cfg(all(unix, not(target_os = "linux")))]
 use std::sync::mpsc::{channel, Receiver};
@@ -85,6 +92,8 @@ pub struct Monitor {
     change_times: Arc<Mutex<HashMap<PathBuf, i64>>>,
     log_buffer: Option<Arc<Mutex<Vec<LogEntry>>>>,
     #[cfg(target_os = "linux")]
+    fanotify: Option<Fanotify>,
+    #[cfg(target_os = "linux")]
     inotify: Option<RefCell<Inotify>>,
     #[cfg(target_os = "linux")]
     watch_map: HashMap<i32, PathBuf>, // Map watch descriptor to directory path
@@ -112,9 +121,29 @@ impl Monitor {
 
         #[cfg(target_os = "linux")]
         {
-            let inotify = Some(RefCell::new(Inotify::init()?));
             let limits = InotifyLimits::read_from_procfs()?;
-            let watch_budget = (limits.max_user_watches as f64 * 0.7) as usize;
+            let mut fanotify_error = None;
+            let root_fanotify = if Uid::effective().is_root() {
+                match Self::init_fanotify() {
+                    Ok(fanotify) => Some(fanotify),
+                    Err(error) => {
+                        fanotify_error = Some(error);
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            let watch_budget = if root_fanotify.is_some() {
+                1
+            } else {
+                (limits.max_user_watches as f64 * 0.7) as usize
+            };
+            let inotify = if root_fanotify.is_some() {
+                None
+            } else {
+                Some(RefCell::new(Inotify::init()?))
+            };
 
             let monitor = Self {
                 snapshot: Arc::new(Mutex::new(snapshot)),
@@ -125,16 +154,26 @@ impl Monitor {
                 max_size_bytes,
                 change_times: Arc::new(Mutex::new(HashMap::new())),
                 log_buffer,
+                fanotify: root_fanotify,
                 inotify,
                 watch_map: HashMap::new(),
             };
 
-            monitor.log("Platform: Linux (inotify)".to_string());
-            monitor.log("inotify limits:".to_string());
-            monitor.log(format!("  max_user_watches: {}", limits.max_user_watches));
-            monitor.log(format!("  max_user_instances: {}", limits.max_user_instances));
-            monitor.log(format!("  max_queued_events: {}", limits.max_queued_events));
-            monitor.log(format!("  Using 70% budget: {} watches", watch_budget));
+            if monitor.fanotify.is_some() {
+                monitor.log("Platform: Linux (fanotify filesystem mark)".to_string());
+            } else {
+                if let Some(error) = fanotify_error {
+                    monitor.log(format!(
+                        "fanotify unavailable as root, falling back to inotify: {error}"
+                    ));
+                }
+                monitor.log("Platform: Linux (inotify)".to_string());
+                monitor.log("inotify limits:".to_string());
+                monitor.log(format!("  max_user_watches: {}", limits.max_user_watches));
+                monitor.log(format!("  max_user_instances: {}", limits.max_user_instances));
+                monitor.log(format!("  max_queued_events: {}", limits.max_queued_events));
+                monitor.log(format!("  Using 70% budget: {} watches", watch_budget));
+            }
             monitor.log(format!("  Max file size: {} MB", max_size_mb));
 
             Ok(monitor)
@@ -170,7 +209,76 @@ impl Monitor {
     }
 
     #[cfg(target_os = "linux")]
+    fn init_fanotify() -> std::io::Result<Fanotify> {
+        Fanotify::init(
+            InitFlags::FAN_CLOEXEC | InitFlags::FAN_NONBLOCK | InitFlags::FAN_CLASS_NOTIF,
+            EventFFlags::O_RDONLY | EventFFlags::O_LARGEFILE | EventFFlags::O_CLOEXEC,
+        )
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))
+    }
+
+    #[cfg(target_os = "linux")]
     pub fn setup_watches(&mut self, scan_root: &Path) -> std::io::Result<()> {
+        if self.fanotify.is_some() {
+            match self.setup_fanotify_watch(scan_root) {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    self.log(format!(
+                        "fanotify filesystem mark failed, falling back to inotify: {error}"
+                    ));
+                    self.fanotify = None;
+                    self.inotify = Some(RefCell::new(Inotify::init()?));
+                    let limits = InotifyLimits::read_from_procfs()?;
+                    self.watch_budget = (limits.max_user_watches as f64 * 0.7) as usize;
+                }
+            }
+        }
+
+        self.setup_inotify_watches(scan_root)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn setup_fanotify_watch(&mut self, scan_root: &Path) -> std::io::Result<()> {
+        self.log(format!(
+            "Setting up fanotify filesystem mark on: {}",
+            scan_root.display()
+        ));
+
+        let Some(ref fanotify) = self.fanotify else {
+            return Ok(());
+        };
+
+        let root = std::fs::File::open(scan_root)?;
+        let mark_flags = MarkFlags::FAN_MARK_ADD | MarkFlags::FAN_MARK_FILESYSTEM;
+        let event_mask = MaskFlags::FAN_MODIFY
+            | MaskFlags::FAN_CLOSE_WRITE
+            | MaskFlags::FAN_ATTRIB
+            | MaskFlags::FAN_CREATE
+            | MaskFlags::FAN_DELETE
+            | MaskFlags::FAN_MOVED_FROM
+            | MaskFlags::FAN_MOVED_TO
+            | MaskFlags::FAN_DELETE_SELF
+            | MaskFlags::FAN_MOVE_SELF
+            | MaskFlags::FAN_EVENT_ON_CHILD
+            | MaskFlags::FAN_ONDIR;
+
+        fanotify
+            .mark(mark_flags, event_mask, &root, Option::<&Path>::None)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))?;
+
+        self.watched_dirs.insert(scan_root.to_path_buf());
+        self.watches_used = 1;
+        self.watch_budget = 1;
+
+        self.log("\n=== Watch Summary ===".to_string());
+        self.log("Total watches used: 1 (fanotify filesystem mark)".to_string());
+        self.log(format!("Watched filesystem containing: {}", scan_root.display()));
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn setup_inotify_watches(&mut self, scan_root: &Path) -> std::io::Result<()> {
         // Linux inotify: Watch as many directories as budget allows
         // Priority: critical_dirs first, then depth-first traversal
         self.log(format!("Setting up inotify watches (budget: {})", self.watch_budget));
@@ -270,6 +378,114 @@ impl Monitor {
 
     #[cfg(target_os = "linux")]
     pub fn process_events(&self) -> Vec<FileEvent> {
+        if self.fanotify.is_some() {
+            return self.process_fanotify_events();
+        }
+
+        self.process_inotify_events()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn process_fanotify_events(&self) -> Vec<FileEvent> {
+        let mut events = Vec::new();
+        let mut seen_paths = HashSet::new();
+        let mut needs_scan = false;
+
+        let Some(ref fanotify) = self.fanotify else {
+            return events;
+        };
+
+        let fanotify_events = match fanotify.read_events() {
+            Ok(events) => events,
+            Err(_) => return events,
+        };
+
+        for event in fanotify_events {
+            let mask = event.mask();
+            if mask.contains(MaskFlags::FAN_Q_OVERFLOW) {
+                self.log("fanotify event queue overflowed".to_string());
+                continue;
+            }
+
+            let Some(fd) = event.fd() else {
+                continue;
+            };
+
+            let fd_path = PathBuf::from(format!("/proc/self/fd/{}", fd.as_raw_fd()));
+            let Ok(path) = std::fs::read_link(fd_path) else {
+                continue;
+            };
+
+            if mask.intersects(MaskFlags::FAN_DELETE | MaskFlags::FAN_DELETE_SELF)
+                && self.is_known_file(&path)
+            {
+                Self::push_event(&mut events, &mut seen_paths, FileEvent::Removed(path));
+            } else if path.is_file() {
+                if mask.intersects(MaskFlags::FAN_CREATE | MaskFlags::FAN_MOVED_TO) {
+                    Self::push_event(&mut events, &mut seen_paths, FileEvent::Created(path));
+                } else {
+                    Self::push_event(&mut events, &mut seen_paths, FileEvent::Modified(path));
+                }
+            } else {
+                needs_scan = true;
+            }
+        }
+
+        if needs_scan {
+            self.add_scan_events(&mut events, &mut seen_paths);
+        }
+
+        events
+    }
+
+    #[cfg(target_os = "linux")]
+    fn push_event(
+        events: &mut Vec<FileEvent>,
+        seen_paths: &mut HashSet<PathBuf>,
+        event: FileEvent,
+    ) {
+        let path = match &event {
+            FileEvent::Created(path) | FileEvent::Modified(path) | FileEvent::Removed(path) => {
+                path
+            }
+        };
+
+        if seen_paths.insert(path.clone()) {
+            events.push(event);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn add_scan_events(&self, events: &mut Vec<FileEvent>, seen_paths: &mut HashSet<PathBuf>) {
+        if let Ok(changed_paths) = self.verify_all_files() {
+            for path in changed_paths {
+                if path.exists() {
+                    Self::push_event(events, seen_paths, FileEvent::Modified(path));
+                } else {
+                    Self::push_event(events, seen_paths, FileEvent::Removed(path));
+                }
+            }
+        }
+
+        if let Ok(new_paths) = self.scan_for_new_files() {
+            for path in new_paths {
+                Self::push_event(events, seen_paths, FileEvent::Created(path));
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn is_known_file(&self, path: &Path) -> bool {
+        let snapshot = self.snapshot.lock().unwrap();
+        snapshot
+            .nodes
+            .get(path)
+            .map(|node| !node.is_dir)
+            .unwrap_or(false)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn process_inotify_events(&self) -> Vec<FileEvent> {
         let mut events = Vec::new();
 
         if let Some(ref inotify) = self.inotify {

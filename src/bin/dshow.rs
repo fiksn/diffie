@@ -42,7 +42,7 @@ struct Args {
         value_name = "DIR",
         num_args = 0..,
         default_values = DEFAULT_CRITICAL_DIRS,
-        help = "Critical directories to watch with inotify/FSEvents"
+        help = "Critical directories to watch with fanotify/inotify/FSEvents"
     )]
     critical: Vec<String>,
 
@@ -61,7 +61,7 @@ struct Args {
     #[arg(long, help = "Use memory-mapped file loading for large snapshots (reduces memory usage)")]
     mmap: bool,
 
-    #[arg(long, help = "Disable periodic polling/scanning - rely only on inotify/FSEvents (faster but may miss changes outside watched directories)")]
+    #[arg(long, help = "Disable periodic polling/scanning - rely only on fanotify/inotify/FSEvents (faster but may miss changes outside watched directories)")]
     no_scan: bool,
 }
 
@@ -629,7 +629,7 @@ fn main() -> Result<(), io::Error> {
         let (watches_used, watch_budget, watched_dirs) = monitor.get_watch_stats();
         if monitor.is_watch_budget_exceeded() {
             let warning = format!(
-                "⚠️  WARNING: inotify/FSEvents watch budget exceeded! ({}/{} watches used)",
+                "⚠️  WARNING: fanotify/inotify/FSEvents watch budget exceeded! ({}/{} watches used)",
                 watches_used, watch_budget
             );
             add_log_entry(&log_buffer, warning.clone());
@@ -648,7 +648,7 @@ fn main() -> Result<(), io::Error> {
             }
         } else if args.no_scan {
             add_log_entry(&log_buffer,
-                format!("--no-scan enabled: relying only on inotify/FSEvents ({}/{} watches)",
+                format!("--no-scan enabled: relying only on fanotify/inotify/FSEvents ({}/{} watches)",
                     watches_used, watch_budget));
         }
 
@@ -687,11 +687,11 @@ fn main() -> Result<(), io::Error> {
         thread::spawn(move || {
             let mut poll_counter = 0;
             loop {
-                // Check FSEvents/inotify every 100ms for responsive updates
+                // Check fanotify/inotify/FSEvents every 100ms for responsive updates
                 thread::sleep(Duration::from_millis(100));
                 poll_counter += 1;
 
-                // Process inotify/FSEvents - batch processing for efficiency
+                // Process fanotify/inotify/FSEvents - batch processing for efficiency
                 let fs_events = {
                     let monitor = monitor_clone.lock().unwrap();
                     monitor.process_events()

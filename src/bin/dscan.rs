@@ -21,7 +21,7 @@ struct Args {
     #[arg(short, long, help = "Append to existing snapshot file (scans subdirectory and merges)")]
     append: Option<String>,
 
-    #[arg(short, long, help = "Interactive mode: monitor changes in real-time using inotify (critical dirs) and polling")]
+    #[arg(short, long, help = "Interactive mode: monitor changes in real-time using fanotify/inotify and polling")]
     interactive: bool,
 
     #[arg(long, value_name = "DIR", num_args = 0.., default_values = DEFAULT_CRITICAL_DIRS, help = "Critical directories to watch")]
@@ -136,7 +136,7 @@ fn run_interactive_mode(
 
         println!("[{}] Checking for changes...", jiff::Zoned::now().strftime("%H:%M:%S"));
 
-        // Process inotify/FSEvents
+        // Process fanotify/inotify/FSEvents
         {
             let fs_events = monitor.process_events();
             if !fs_events.is_empty() {
